@@ -84,6 +84,21 @@ DKMS_VER=0.1.0
 DKMS_SRC="/usr/src/$DKMS_NAME-$DKMS_VER"
 KREL="$(uname -r)"
 
+# ⚠ 关键前提：DKMS 只会用 /var/lib/shim-signed/mok/ 那对密钥签名。
+#   本机（以及任何没生成过 shim MOK 的机器）这个目录是空的 —— 如果照常
+#   `dkms install`，会往 /lib/modules/<ver>/updates/dkms 塞一个**未签名**的
+#   .ko，而 updates/ 的优先级高于 extra/ ⇒ 重启后原本能加载的模块反而失效。
+#   所以在"Secure Boot 开着 + DKMS 没有可用签名密钥"时，**跳过安装**，
+#   不动现有模块，只打印一次性操作步骤。
+SB_ON=0
+if [ -d /sys/firmware/efi ] && command -v mokutil >/dev/null 2>&1; then
+    mokutil --sb-state 2>/dev/null | grep -qi enabled && SB_ON=1
+fi
+DKMS_MOK_OK=0
+if [ -f /var/lib/shim-signed/mok/MOK.der ] && command -v mokutil >/dev/null 2>&1; then
+    mokutil --test-key /var/lib/shim-signed/mok/MOK.der >/dev/null 2>&1 && DKMS_MOK_OK=1
+fi
+
 if [ -d "$DKMS_SRC" ]; then
     if ! command -v dkms >/dev/null 2>&1; then
         log "未安装 dkms —— 风扇控制不可用（监视与内核级设置仍可用）"
@@ -91,6 +106,13 @@ if [ -d "$DKMS_SRC" ]; then
     elif [ ! -d "/lib/modules/$KREL/build" ]; then
         log "缺少当前内核头文件，模块未编译"
         log "  修：sudo apt install linux-headers-$KREL && sudo dpkg-reconfigure $PKG"
+    elif [ "$SB_ON" = 1 ] && [ "$DKMS_MOK_OK" = 0 ]; then
+        log "Secure Boot 已开启，但 DKMS 没有可用的签名密钥（/var/lib/shim-signed/mok 为空）。"
+        log "  为避免用未签名模块覆盖现有可用的那份，本次**跳过模块安装**。"
+        log "  一次性操作（之后重新运行本脚本即可完成安装）："
+        log "    1) sudo bash $DKMS_SRC/install.sh --genkey"
+        log "    2) sudo reboot        # 蓝色 MOK 界面确认导入"
+        log "    3) sudo dpkg-reconfigure $PKG"
     else
         dkms add -m "$DKMS_NAME" -v "$DKMS_VER" >/dev/null 2>&1 || true
         if dkms build -m "$DKMS_NAME" -v "$DKMS_VER" >/dev/null 2>&1 &&
@@ -103,19 +125,6 @@ if [ -d "$DKMS_SRC" ]; then
         fi
     fi
 
-    # Secure Boot 的硬限制：DKMS 只能用**本机已注册**的 MOK 签名。
-    # 没有的话模块会编出来但加载不了 —— 这一步无法全自动（enroll 要重启 + 蓝屏确认）。
-    if [ -d /sys/firmware/efi ] && command -v mokutil >/dev/null 2>&1; then
-        if mokutil --sb-state 2>/dev/null | grep -qi enabled; then
-            if [ ! -f /var/lib/shim-signed/mok/MOK.der ] ||
-               ! mokutil --test-key /var/lib/shim-signed/mok/MOK.der >/dev/null 2>&1; then
-                log "Secure Boot 已开启，且本机没有已注册的 MOK 签名密钥。"
-                log "  模块可能无法加载。一次性处理："
-                log "    sudo bash $DKMS_SRC/install.sh --genkey"
-                log "    sudo reboot    # 在蓝色 MOK 界面确认导入（只需一次）"
-            fi
-        fi
-    fi
 fi
 
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then

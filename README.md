@@ -380,8 +380,16 @@ postinst 还会：写免密规则（只放开该 helper、只给 `sudo` 组，`v
 （`/usr/local/bin`、`~/.local/bin`、用户级 `.desktop` 与用户级托盘自启
 —— 它们会在 PATH / 菜单 / 会话里盖住新版或拉起第二个托盘）。
 
-> 内核模块**不在这个包里**：它需要按内核版本编译 + MOK 签名 + Secure Boot 确认，
-> 不适合塞进 postinst。安装见 `omen-wmi-omen/install.sh`。
+> **内核模块现在随包安装**：`/usr/src/hp-wmi-omen-0.1.0/` 是模块源码，postinst 用
+> **DKMS** 针对当前内核编译并签名；以后内核升级由 DKMS 自动重建。
+>
+> 能不能"装完就可用"，取决于 Secure Boot：
+>
+> | 机器状态 | 装完 deb 后 |
+> | :- | :- |
+> | Secure Boot 关闭 | ✅ 直接可用 |
+> | Secure Boot 开启 + 已有已注册 MOK（`/var/lib/shim-signed/mok/`） | ✅ DKMS 自动签名，直接可用 |
+> | Secure Boot 开启 + 没有任何 MOK（**本机就是这种**，该目录为空） | ⚠️ postinst **跳过**模块安装（避免用未签名模块覆盖已有可用版本），需一次性：`sudo bash /usr/src/hp-wmi-omen-0.1.0/install.sh --genkey` → 重启并在蓝色界面确认 → `sudo dpkg-reconfigure omen-control` |
 >
 > **为什么 `~/.local/bin/omen-control` 是个符号链接**：postinst 不再把那里的旧副本
 > "移开"，而是把它做成指向 `/usr/bin/omen-control` 的链接。除了消灭"两份二进制"，
