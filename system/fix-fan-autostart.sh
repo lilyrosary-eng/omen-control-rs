@@ -22,7 +22,14 @@ ok() { echo "[完成] $*"; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTRL="$(dirname "$HERE")"                      # omen-control-rs
-WMI="$(cd "$CTRL/../omen-wmi-omen" 2>/dev/null && pwd)" || die "找不到同级的 omen-wmi-omen 目录"
+# 模块仓库默认在同一级；也可显式指定 OMEN_KERNEL_REPO=/path/to/omen-wmi-omen
+if [ -n "${OMEN_KERNEL_REPO:-}" ]; then
+    WMI="$OMEN_KERNEL_REPO"
+    [ -d "$WMI" ] || die "OMEN_KERNEL_REPO 指向的目录不存在：$WMI"
+else
+    WMI="$(cd "$CTRL/../omen-wmi-omen" 2>/dev/null && pwd)" \
+        || die "找不到同级的 omen-wmi-omen 目录（可用 OMEN_KERNEL_REPO=... 指定）"
+fi
 NODE=/sys/devices/platform/omen-wmi/fan_speed
 UNIT=/etc/systemd/system/omen-fand.service
 

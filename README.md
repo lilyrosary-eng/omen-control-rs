@@ -23,6 +23,13 @@ HP OMEN 笔记本在 Linux 上的性能与散热控制面板 + 监视浮窗。
 
 配套内核模块：[`hp-wmi-omen`](../omen-wmi-omen)（GPL-2.0）。
 
+> **仓库布局**：两个仓库请并排放置（安装脚本按同级目录找模块源码）：
+> ```bash
+> git clone https://github.com/<you>/omen-wmi-omen.git
+> git clone https://github.com/<you>/omen-control-rs.git
+> ```
+> 也可用 `OMEN_KERNEL_REPO=/path/to/omen-wmi-omen` 指定别的位置。
+
 > ## 本项目的两条硬规则
 >
 > **1. 界面上不出现无效控件。** 任何"点了没反应"的开关都不算功能，而是缺陷。
