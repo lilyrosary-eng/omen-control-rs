@@ -1,0 +1,83 @@
+#!/bin/sh
+# ============================================================================
+# omen-tray-restart —— 在目标用户的图形会话里**重启托盘**
+#
+# 为什么需要它（用户明确要求，2026-10-11）：
+#   deb 升级会把 `/usr/libexec/omen-control/omen-tray` 换成新文件，但**正在运行的
+#   那个托盘进程**仍持有旧文件的 inode、继续跑旧代码 —— 于是"升级了但行为没变"，
+#   或者新旧两份东西同时存在互相干扰。用户要的是「升级就把上一个同类进程杀掉」。
+#
+#   但**光杀掉不够**：托盘是登录会话里的常驻进程，杀掉之后没人再拉起来，
+#   用户看到的就是"托盘没了"（只能重新登录才回来）。所以这里做三件事：
+#     1) 从旧托盘进程的 /proc/<pid>/environ 捞它的**图形会话环境**
+#        （WAYLAND_DISPLAY / DISPLAY / DBUS_SESSION_BUS_ADDRESS —— 从进程里捞
+#         比在 root 下猜准得多）；
+#     2) 杀掉旧托盘；
+#     3) 用同一套环境以目标用户身份把**新托盘**拉起来（`setsid` 脱离本次安装的
+#        进程组，免得被 apt 收尾时一起带走）。
+#
+# 用法：
+#   omen-tray-restart [用户名]        # 不给用户名就取第一个普通用户
+#   （由 deb 的 postinst 自动调用；用户也可手动跑：sudo omen-tray-restart）
+# ============================================================================
+set -eu
+
+TRAY=/usr/libexec/omen-control/omen-tray
+[ -x "$TRAY" ] || exit 0
+
+U="${1:-}"
+if [ -z "$U" ]; then
+    U=$(awk -F: '$3>=1000 && $3<65534 && $6!="" && $6!="/" {print $1; exit}' /etc/passwd)
+fi
+[ -n "$U" ] || exit 0
+
+UIDN=$(id -u "$U" 2>/dev/null) || exit 0
+RT="/run/user/$UIDN"
+# 没有运行时目录 = 该用户没有活动的图形会话（没登录/在 tty 上）⇒ 什么都不做，
+# 下次登录时 /etc/xdg/autostart 的那条会正常拉起。
+[ -d "$RT" ] || exit 0
+
+# ── 1) 捞旧托盘的会话环境 ──────────────────────────────────────────────────
+ENVDUMP=""
+if command -v pgrep >/dev/null 2>&1; then
+    for pid in $(pgrep -f "$TRAY\$" 2>/dev/null || true); do
+        if [ -r "/proc/$pid/environ" ]; then
+            ENVDUMP=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)
+            if [ -n "$ENVDUMP" ]; then break; fi
+        fi
+    done
+fi
+grab() { printf '%s\n' "$ENVDUMP" | sed -n "s/^$1=//p" | head -1; }
+
+WD=$(grab WAYLAND_DISPLAY); WD="${WD:-wayland-0}"
+DP=$(grab DISPLAY);         DP="${DP:-:0}"
+DB=$(grab DBUS_SESSION_BUS_ADDRESS); DB="${DB:-unix:path=$RT/bus}"
+
+# ── 2) 杀掉旧托盘（旧 inode 上的旧代码）────────────────────────────────────
+#
+# ⚠⚠⚠ `pkill -f "$TRAY"` 会**把自己杀掉**（2026-10-11 实测踩到）：
+#   本脚本自身的命令行是 `/bin/sh /usr/libexec/omen-control/omen-tray-restart`，
+#   它**包含**子串 `/usr/libexec/omen-control/omen-tray` ⇒ `-f`（匹配整条命令行）
+#   把本脚本也匹配上并 SIGTERM ⇒ 脚本在第 2 步就死了 ⇒ **第 3 步永远执行不到**。
+#   用户看到的现象有两处，全都对得上：
+#     · apt 输出里一行没头没脑的 `Terminated`（父 shell 在报告子进程被信号杀掉）；
+#     · **升级完托盘就没了**，而且旧托盘确实被杀了 ⇒ 只能重新登录才回来。
+#   修法：用 `$` **锚定命令行末尾**。托盘的 cmdline 恰好以这个路径结尾
+#   （`exec` 脚本 或 `python3 <路径>` 都成立），而 `omen-tray-restart` 以
+#   `-restart` 结尾 ⇒ 天然不匹配。再显式排除自己，双保险。
+for pid in $(pgrep -f "$TRAY\$" 2>/dev/null || true); do
+    # 用 if 而不是 `[ … ] && continue`：后者在条件为假时会让整条 and-or 列表
+    # 返回非 0，在 `set -e` 下是个隐患（且不易察觉）。
+    if [ "$pid" != "$$" ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+done
+[ -z "$(pgrep -f "$TRAY\$" 2>/dev/null || true)" ] || sleep 1
+
+# ── 3) 以目标用户身份拉起新托盘 ────────────────────────────────────────────
+su -s /bin/sh "$U" -c \
+    "XDG_RUNTIME_DIR=$RT DBUS_SESSION_BUS_ADDRESS=$DB WAYLAND_DISPLAY=$WD DISPLAY=$DP \
+     setsid $TRAY >/dev/null 2>&1 &" >/dev/null 2>&1 || exit 0
+
+echo "omen-control: 托盘已重启（用户 $U）。"
+exit 0

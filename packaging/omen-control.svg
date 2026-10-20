@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OMEN 控制面板 图标（手绘 SVG，单文件、无外部依赖、无位图）
+
+  设计意图（为什么长这样）：
+    · 主体是一枚**四叶后掠叶轮**：叶片在 22px（应用网格尺寸）下仍能看出是
+      四片独立叶片而不是一团（三版几何实渲对比后选的这一版；细叶版小尺寸像"+"，
+      圆叶版像四叶草，只有这版有"风机"感）。
+    · 配色用**以轮毂为圆心的径向渐变**：轮毂附近暖橙（热源）、叶尖冷蓝（被吹散）
+      —— 这正是本工具在做的事（压热源 + 排热）。刻意让暖区延伸到 r≈84，
+      因为轮毂（r=46）会盖在上面，暖色太靠里就等于看不见。
+    · 深色圆角方底 + 高对比叶轮 ⇒ 小尺寸靠**剪影**认图，不靠细节。
+    · 不放文字：16px 下必然不可读。
+
+  ⚠ 两条刻意的"抗渲染器"设计（都踩过）：
+    1. **不用 `transform`** —— 四片叶子的旋转已烘进路径坐标。实测 ImageMagick 的
+       内部 SVG 引擎会直接忽略 path 上的 transform，渲染出的图**少掉全部叶片**。
+    2. **每个用渐变/颜色的元素都先画一层实色再叠渐变** —— 规范里"渐变解析失败 =
+       该元素不绘制"，遇到过不认渐变的渲染器就会得到只剩轮毂的空图。
+       叠一层实色后，任何渲染器至少都能画出完整形状。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c3547"/>
+      <stop offset="1" stop-color="#131722"/>
+    </linearGradient>
+    <!-- 叶片：以轮毂为圆心的径向渐变；userSpaceOnUse 保证四片朝向不同的叶子
+         共用同一个中心（若用默认的 objectBoundingBox，每片会各自"发光"）。 -->
+    <radialGradient id="blade" gradientUnits="userSpaceOnUse" cx="256" cy="256" r="152">
+      <stop offset="0"    stop-color="#ffd27a"/>
+      <stop offset="0.50" stop-color="#ffa445"/>
+      <stop offset="0.56" stop-color="#9ccbf0"/>
+      <stop offset="1"    stop-color="#e8f5ff"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 深色圆角方底（四周留 16px，避免在网格里顶到边缘） -->
+  <rect x="16" y="16" width="480" height="480" rx="106" fill="#1f2736"/>
+  <rect x="16" y="16" width="480" height="480" rx="106" fill="url(#bg)"/>
+  <!-- 极淡内描边：让图标在纯黑或纯白背景上都有边界 -->
+  <rect x="16" y="16" width="480" height="480" rx="106"
+        fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+
+  <!-- 叶轮：实色层（兜底） + 渐变层 -->
+  <g fill="#9ccbf0">
+    <path d="M256 244 C200 216 182 148 216 104 C250 62 300 96 300 152 Z"/>
+    <path d="M268 256 C296 200 364 182 408 216 C450 250 416 300 360 300 Z"/>
+    <path d="M256 268 C312 296 330 364 296 408 C262 450 212 416 212 360 Z"/>
+    <path d="M244 256 C216 312 148 330 104 296 C62 262 96 212 152 212 Z"/>
+  </g>
+  <g fill="url(#blade)">
+    <path d="M256 244 C200 216 182 148 216 104 C250 62 300 96 300 152 Z"/>
+    <path d="M268 256 C296 200 364 182 408 216 C450 250 416 300 360 300 Z"/>
+    <path d="M256 268 C312 296 330 364 296 408 C262 450 212 416 212 360 Z"/>
+    <path d="M244 256 C216 312 148 330 104 296 C62 262 96 212 152 212 Z"/>
+  </g>
+
+  <!-- 轮毂：深色盘 + 暖色环 + 暖色芯，把四片叶子"焊"成一个整体 -->
+  <circle cx="256" cy="256" r="46" fill="#101520"/>
+  <circle cx="256" cy="256" r="46" fill="none" stroke="#ffa445" stroke-opacity="0.6" stroke-width="7"/>
+  <circle cx="256" cy="256" r="17" fill="#ffd27a"/>
+</svg>

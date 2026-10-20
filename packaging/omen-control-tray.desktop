@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN 托盘
+Name[en]=OMEN Tray
+Comment=OMEN 档位 / 风扇守护的托盘开关
+Comment[en]=Tray switcher for OMEN presets and fan control
+# 装到 /etc/xdg/autostart —— 登录后由会话自动拉起（不进应用菜单）。
+Exec=/usr/libexec/omen-control/omen-tray
+Icon=omen-control
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

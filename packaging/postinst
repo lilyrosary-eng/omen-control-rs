@@ -1,0 +1,205 @@
+#!/bin/sh
+# omen-control 安装后处理。三件事，全部离线完成：
+#
+#   1) 装免密规则：**只**放开本包自带的那一个白名单 helper，且只给 sudo/admin 组。
+#      用 visudo 预校验 + 双重校验失败即回滚 —— 绝不留下会弄坏 sudo 的文件。
+#   2) 按**安装用户**生成 omen-fand.service。用户名与家目录在包内无法硬编码，
+#      只能在这里代入（对照 system/install-fand.sh 的同名逻辑）。
+#   3) 移开历史遗留的同名副本 —— 它们在 PATH / 桌面菜单里会**盖住**新装的
+#      /usr/bin/omen-control，表现为"升级了但跑的还是旧货"。
+set -eu
+
+PKG=omen-control
+HELPER=/usr/libexec/$PKG/omen-control-helper
+SUDOERS=/etc/sudoers.d/omen-control
+UNIT_TPL=/usr/share/$PKG/omen-fand.service.in
+UNIT=/etc/systemd/system/omen-fand.service
+BIN=/usr/bin/$PKG
+
+log() { echo "$PKG: $*" >&2; }
+
+# ---------------------------------------------------------------- 1) 免密规则
+if [ -x "$HELPER" ] && command -v visudo >/dev/null 2>&1; then
+    GROUP=""
+    if getent group sudo >/dev/null 2>&1; then
+        GROUP="sudo"
+    elif getent group admin >/dev/null 2>&1; then
+        GROUP="admin"
+    fi
+    if [ -n "$GROUP" ]; then
+        TMP="$(mktemp)"
+        # 组成员的 sudo 权限本来就等价，这条只是把"改这几个内核节点"从输密码变成免密，
+        # 并没有扩大权限上限（与 system/setup-nopasswd.sh 的既有判断一致）。
+        {
+            echo "# 由 omen-control 安装包生成：仅免密放开这一个白名单 helper。"
+            echo "# 卸载包时会被 postrm 清理。手工改这里会在下次安装时被覆盖。"
+            echo "%$GROUP ALL=(root) NOPASSWD: $HELPER"
+        } > "$TMP"
+        if visudo -cf "$TMP" >/dev/null 2>&1; then
+            install -o root -g root -m 0440 "$TMP" "$SUDOERS"
+            if visudo -c >/dev/null 2>&1; then
+                log "免密规则已装（组 $GROUP，仅放开 helper）"
+            else
+                rm -f "$SUDOERS"
+                log "警告：sudoers 整体校验失败，已回滚 —— 未启用免密（功能仍可用，会弹密码框）"
+            fi
+        else
+            log "警告：生成的 sudoers 语法校验失败，未安装免密规则（会弹密码框）"
+        fi
+        rm -f "$TMP"
+    else
+        log "提示：系统里没有 sudo/admin 组，跳过免密规则（改档位会弹一次密码框）"
+    fi
+fi
+
+# ---------------------------------------------------------------- 2) 生成 unit
+TARGET_USER=""
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
+    TARGET_USER="$SUDO_USER"
+else
+    TARGET_USER="$(awk -F: '$3>=1000 && $3<65534 && $6!="" && $6!="/" {print $1; exit}' /etc/passwd 2>/dev/null || true)"
+fi
+
+if [ -n "$TARGET_USER" ] && [ -f "$UNIT_TPL" ]; then
+    HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    if [ -n "$HOME_DIR" ]; then
+        sed -e "s|@USER@|$TARGET_USER|g" \
+            -e "s|@CONFIG_DIR@|$HOME_DIR/.config/$PKG|g" \
+            -e "s|@BIN@|$BIN|g" \
+            "$UNIT_TPL" > "$UNIT"
+        log "已生成 $UNIT（User=$TARGET_USER · OMEN_CONFIG_DIR=$HOME_DIR/.config/$PKG）"
+    fi
+fi
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable omen-fand.service >/dev/null 2>&1 || true
+    # 升级场景：正在跑的守护持有的是**旧二进制的 inode**，必须重启才会换成新的。
+    # try-restart = 只在它当前是 active 时才重启，全新安装时不会无端拉起来。
+    systemctl try-restart omen-fand.service >/dev/null 2>&1 || true
+fi
+
+# ---------------------------------------------------------------- 3) 移开历史副本
+move_aside() {
+    _f="$1"
+    [ -e "$_f" ] || return 0
+    # 属于别的包的文件不动（那是别人的地盘）
+    if dpkg -S "$_f" >/dev/null 2>&1; then
+        return 0
+    fi
+    if mv -f "$_f" "$_f.pre-deb" 2>/dev/null; then
+        log "已移开历史副本 $_f → $_f.pre-deb（它会盖住 $BIN）"
+    fi
+}
+
+move_aside "/usr/local/bin/$PKG"
+if [ -n "$TARGET_USER" ]; then
+    UH="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    if [ -n "$UH" ]; then
+        # ⚠⚠ 这里**不再**把 `~/.local/bin/omen-control` 移开，而是把它做成
+        #   **指向 /usr/bin/omen-control 的符号链接**。两个理由，都是实测踩出来的：
+        #
+        #   1) 陈旧副本（原 move_aside 的目的）：源码安装曾往这里放过一份**真副本**，
+        #      它在 PATH 上优先于 /usr/bin，于是"跑的是哪一份"永远说不清。
+        #      换成符号链接后"只有一份二进制"依然成立 —— 链接不会过期。
+        #   2) **GNOME Shell 会缓存启动项的路径**（2026-10-11 实测，用户第二次报
+        #      "全部应用中点击打不开"）：shell 如果在启动时见过一个指向本路径的
+        #      `.desktop`，就会把该路径缓存在内存里；之后哪怕那个 `.desktop` 被删掉、
+        #      全盘只剩系统级那一个（Exec 明明是 /usr/bin/omen-control），点"全部应用"
+        #      仍然去 exec 这个路径 ⇒ 报「程序 '/home/<user>/.local/bin/omen-control'
+        #      未在 $PATH 路径中找到」。**光删文件治不了缓存**，留一个永远指向真身的
+        #      链接才行 —— 而且用户不必重新登录。
+        LBIN="$UH/.local/bin"
+        install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" "$LBIN" 2>/dev/null || true
+        if ln -sfn "$BIN" "$LBIN/$PKG" 2>/dev/null; then
+            chown -h "$TARGET_USER:$TARGET_USER" "$LBIN/$PKG" 2>/dev/null || true
+            log "已把 $LBIN/$PKG 指向 $BIN（防陈旧启动项指向空路径）"
+        fi
+        # 源码安装（--install）留下的托盘副本与自启条目：
+        # 不清理的话，/etc/xdg/autostart 与 ~/.config/autostart 会各拉起一个托盘。
+        # （托盘自身有单实例保护，但没必要留着两条互相打架的入口。）
+        move_aside "$UH/.local/bin/omen-tray"
+
+        # ⚠⚠ 用户级的 applications 条目**同名时会盖住系统级条目**，
+        #   而它指向的 ~/.local/bin/omen-control 刚被移走 ⇒ 点菜单报
+        #   "程序 '/home/<user>/.local/bin/omen-control' 未在 $PATH 路径中找到"。
+        #   2026-10-11 实测踩到，用户反馈"应用中心打不开了"。
+        #   而且目录里可能同时存在多个变体（实测见过
+        #   `omen-control.desktop`、`.pre-deb`、`.bak-<时间戳>`），
+        #   所以**按通配符清**，不要只清那一个精确名字。
+        for _f in "$UH/.local/share/applications/$PKG".desktop*; do
+            [ -e "$_f" ] || continue
+            dpkg -S "$_f" >/dev/null 2>&1 && continue
+            case "$_f" in
+                */"$PKG.desktop") move_aside "$_f" ;;
+                *) rm -f "$_f"; log "已删除失效的用户级条目备份：$_f" ;;
+            esac
+        done
+
+        # 开机自启条目同样指向旧路径 —— 不清的话**每次登录**都弹一次同样的错。
+        move_aside "$UH/.config/autostart/$PKG.desktop"
+        # 托盘也有自己的用户级自启条目（源码安装写的），同样要移开。
+        move_aside "$UH/.config/autostart/$PKG-tray.desktop"
+    fi
+fi
+
+# 收尾校验：这条要是还在，它会继续盖住我们装的系统级条目 —— 必须让用户知道
+if [ -n "$TARGET_USER" ]; then
+    UH="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    if [ -n "$UH" ] && [ -e "$UH/.local/share/applications/$PKG.desktop" ]; then
+        log "⚠ 警告：$UH/.local/share/applications/$PKG.desktop 仍存在 ——"
+        log "        它会盖住 /usr/share/applications 里的条目，导致点菜单启动失败。"
+        log "        请手动 mv 掉它（或改 Exec 指向 /usr/bin/$PKG）。"
+    fi
+fi
+
+# ------------------------------------------- 4) 收掉多余的同类进程 + 重启托盘
+#
+# 用户明确要求（2026-10-11）：「每次升级/起服务都要把上一个同类进程杀掉，防止干扰」。
+# 放在最后：上面 postinst 自己起的东西都就位了，再统一收尾，避免"刚起完又被杀"。
+#
+# (0) **旧面板**：这里再收一次，作为 prerm 的兜底。
+#     ⚠ 关键事实（2026-10-11 实测踩到）：dpkg 升级时调用的是**旧包自己的 prerm**。
+#       所以"给 prerm 加杀进程"这件事**要晚一个版本才生效** —— 0.2.8 的 prerm 里
+#       没有这段逻辑，于是升级到带该逻辑的 0.2.9 时，旧面板照样活了下来
+#       （它一直占着 `org.rosary.OmenControl` 这个 GApplication 名，点菜单也不会
+#        再弹窗口）。postinst 属于**新包**，放在这里才当次就有效。
+if command -v pgrep >/dev/null 2>&1; then
+    for _pid in $(pgrep -f '(^|/)omen-control$' 2>/dev/null || true); do
+        if kill "$_pid" 2>/dev/null; then
+            log "已结束仍在运行的旧面板进程 pid=$_pid"
+            _i=0
+            while [ "$_i" -lt 10 ] && kill -0 "$_pid" 2>/dev/null; do
+                sleep 0.2
+                _i=$((_i + 1))
+            done
+            kill -0 "$_pid" 2>/dev/null && kill -9 "$_pid" 2>/dev/null || true
+        fi
+    done
+fi
+
+# (a) **手动 nohup 起的守护**（`omen-control --fan-daemon`，不在 systemd 里）会与
+#     systemd 那个抢同一批硬件节点，两边各按自己读到的配置写 ⇒ 设置来回翻。
+#     留下 systemd 的那一个（MainPID），其余收掉。
+if command -v pgrep >/dev/null 2>&1; then
+    MAINPID=""
+    if command -v systemctl >/dev/null 2>&1; then
+        MAINPID="$(systemctl show omen-fand.service -p MainPID --value 2>/dev/null || true)"
+    fi
+    for _pid in $(pgrep -f -- '--fan-daemon' 2>/dev/null || true); do
+        [ "$_pid" = "$MAINPID" ] && continue
+        if kill "$_pid" 2>/dev/null; then
+            log "已结束多余的手动守护进程 pid=$_pid（统一由 systemd 的守护接管）"
+        fi
+    done
+fi
+
+# (b) **托盘**：升级会把 omen-tray 换成新文件，而正在跑的托盘仍持有旧 inode。
+#     这里统一"杀掉 → 用同一套会话环境拉起新的"。不这么做，用户升级一次就丢一次
+#     托盘（只能重新登录才回来）—— 用户实测反馈过。
+#     没有活动图形会话时脚本自己静默退出，不影响安装。
+if [ -n "$TARGET_USER" ] && [ -x "/usr/libexec/$PKG/omen-tray-restart" ]; then
+    "/usr/libexec/$PKG/omen-tray-restart" "$TARGET_USER" || true
+fi
+
+exit 0

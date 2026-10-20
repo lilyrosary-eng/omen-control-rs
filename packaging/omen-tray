@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""omen-tray —— OMEN 控制面板的系统托盘（GNOME 顶栏 / KDE 状态栏）。
+
+为什么是 Python 而不是 Rust
+    托盘要 libayatana-appindicator（GTK3），而本项目 Rust 侧只有 gtk4/libadwaita。
+    本机 cargo 缓存里没有 dbus / tray 相关 crate，离线无法引入新依赖。
+    系统自带的 python3-gi + gir1.2-ayatanaappindicator3-0.1 已经齐了
+    ⇒ 零编译、零新增下载，直接可用。
+
+它自己不写任何硬件节点，每个动作都转发给现成的入口
+    档位切换   → omen-control --set-preset <key>      （与面板按钮同一套逻辑）
+    风扇守护   → (sudo -n) omen-control-helper set-fan-daemon on|off
+    CPU 温度   → 只读 /sys/class/hwmon（与面板 --check 同源）
+    GPU 温度   → nvidia-smi（后台线程，见 gpu_query 的说明）
+    风扇转速   → 只读 hp-wmi 的 hwmon
+
+单实例：启动时扫 /proc，发现已有 omen-tray 就直接退出，避免顶栏出现两个图标。
+"""
+
+import glob
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from shutil import which
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+    from gi.repository import GLib, Gtk
+except Exception as exc:  # 缺依赖时给出可照做的提示，而不是一串 traceback
+    sys.stderr.write(
+        "omen-tray: 缺少托盘运行库（{0}）\n"
+        "请安装：sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1\n".format(
+            exc
+        )
+    )
+    sys.exit(1)
+
+APP_ID = "omen-control"
+REFRESH_SECS = 2
+NOTICE_SECS = 6
+# GPU 单独一个后台线程刷（nvidia-smi 要起进程，比读 sysfs 贵得多）
+GPU_REFRESH_SECS = 2
+
+# 与 hw::HELPER_CANDIDATES 保持一致（deb 装到 /usr/libexec，历史脚本装到 /usr/local/libexec）
+HELPER_CANDIDATES = [
+    "/usr/libexec/omen-control/omen-control-helper",
+    "/usr/local/libexec/omen-control-helper",
+]
+
+# key 必须与 hw::PRESETS 一致（--set-preset 收到的就是这些 key）
+PRESETS = [
+    ("eco", "省电"),
+    ("quiet", "安静"),
+    ("balanced", "均衡"),
+    ("performance", "性能"),
+]
+
+
+# ------------------------------------------------------------------ 路径 / 读数
+def config_path():
+    """用户配置文件路径。与 hw::config_path 同一套推导规则（含 OMEN_CONFIG_DIR）。"""
+    d = os.environ.get("OMEN_CONFIG_DIR")
+    if d and os.path.isabs(d):
+        return os.path.join(d, "config")
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "omen-control", "config")
+
+
+def read_preset():
+    """读配置里保存的档位 key；读不到返回 None。"""
+    try:
+        with open(config_path(), "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, _, val = line.partition("=")
+                if key.strip() == "preset":
+                    return val.strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def _read_int(path):
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def cpu_temp():
+    """CPU 封装温度（°C）。与 hw::temps 同规则：coretemp 的 'Package' 优先。"""
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if not (
+            name.startswith("coretemp")
+            or name.startswith("k10temp")
+            or name.startswith("zenpower")
+        ):
+            continue
+        package = None
+        hottest = None
+        for i in range(1, 65):
+            inp = os.path.join(hw, "temp%d_input" % i)
+            if not os.path.exists(inp):
+                continue
+            milli = _read_int(inp)
+            if milli is None or milli <= 0:
+                continue
+            val = milli / 1000.0
+            label = ""
+            try:
+                with open(os.path.join(hw, "temp%d_label" % i)) as f:
+                    label = f.read()
+            except OSError:
+                pass
+            if "Package" in label:
+                package = val
+                break
+            hottest = val if hottest is None else max(hottest, val)
+        if package is not None:
+            return package
+        if hottest is not None:
+            return hottest
+    return None
+
+
+def fan_rpms():
+    """各风扇转速（RPM）。与 hw::fan_rpms 同源：hp-wmi 的 hwmon。"""
+    out = []
+    for hw in sorted(glob.glob("/sys/devices/platform/hp-wmi/hwmon/hwmon*")):
+        for inp in sorted(glob.glob(os.path.join(hw, "fan*_input"))):
+            v = _read_int(inp)
+            if v is not None:
+                out.append(v)
+    return out
+
+
+def _nvidia_smi():
+    for p in ("/usr/bin/nvidia-smi",):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return which("nvidia-smi")
+
+
+def gpu_present():
+    return _nvidia_smi() is not None
+
+
+def _csv_num(s):
+    """nvidia-smi 的 CSV 单元：`[N/A]`、`N/A`、空串都算缺值（与 hw.rs 同规则）。"""
+    s = s.strip()
+    if not s or s.startswith("[") or s.lower() == "n/a":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def gpu_query():
+    """一次 nvidia-smi 取回 GPU 温度 / 功耗 / 占用率；取不到返回 None。
+
+    ⚠ 为什么不读 sysfs：本机（以及绝大多数笔记本 N 卡）**没有 nvidia 的 hwmon 节点**
+      —— 实测 /sys/class/hwmon 下只有 coretemp / nvme / acpitz / hp / iwlwifi。
+      nvidia-smi 是唯一可靠来源；但它要起进程（实测空载 29ms、满载更久），
+      所以**调用方必须放后台线程**，别卡住 GTK 主循环（Rust 面板侧也是这么做的）。
+    """
+    smi = _nvidia_smi()
+    if not smi:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                smi,
+                "--query-gpu=temperature.gpu,power.draw,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=6,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+    if not lines:
+        return None
+    f = [x.strip() for x in lines[0].split(",")]
+    if len(f) < 3:
+        return None
+    temp = _csv_num(f[0])
+    if temp is None:
+        return None
+    return {"temp": temp, "power": _csv_num(f[1]), "util": _csv_num(f[2])}
+
+
+def fan_daemon_active():
+    """omen-fand.service 是否在跑（用 systemctl，而非猜 /proc）。"""
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "omen-fand.service"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return r.stdout.decode("utf-8", "replace").strip() == "active"
+    except Exception:
+        return False
+
+
+def find_bin():
+    """omen-control 可执行文件：系统安装优先，其次源码安装。"""
+    for p in (
+        "/usr/bin/omen-control",
+        os.path.join(os.path.expanduser("~"), ".local/bin/omen-control"),
+    ):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return which("omen-control")
+
+
+def find_helper():
+    for p in HELPER_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def pick_icon():
+    """优先用自家图标；找不到就退回系统主题里的监控图标（保证不是空白）。"""
+    for base in (
+        "/usr/share/icons/hicolor/scalable/apps",
+        os.path.join(os.path.expanduser("~"), ".local/share/icons/hicolor/scalable/apps"),
+    ):
+        if os.path.isfile(os.path.join(base, "omen-control.svg")):
+            return "omen-control"
+    return "utilities-system-monitor"
+
+
+def panel_pids():
+    """主面板的 PID 列表（cmdline 恰好是那个可执行文件、**不带参数**的那条）。
+
+    ⚠⚠ 绝不能按进程名（`comm`）找：面板 / 守护 / 浮窗三者的进程名**都是**
+      `omen-control` —— 按名字杀会把 systemd 正在跑的 `--fan-daemon` 一起打死，
+      风扇当掉落回固件。只认"只有一个参数"的形态就精确了：
+      `--fan-daemon …` / `--hud` 都是两个以上参数，天然被排除。
+      顺带：这样也不依赖 `pkill` 是否安装。
+    """
+    out = []
+    me = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for pid in entries:
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        args = [a for a in raw.split(b"\0") if a]
+        if len(args) != 1:
+            continue
+        if os.path.basename(args[0].decode("utf-8", "replace")) == "omen-control":
+            out.append(int(pid))
+    return out
+
+
+def already_running():
+    """扫 /proc，看是否已有另一个 omen-tray（避免顶栏出现两个图标）。"""
+    me = os.getpid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        args = [a for a in raw.split(b"\0") if a]
+        for i, a in enumerate(args):
+            name = os.path.basename(a.decode("utf-8", "replace"))
+            if name == "omen-tray" and (i == 0 or args[0].endswith(b"python3")):
+                return True
+    return False
+
+
+# ------------------------------------------------------------------------ 托盘
+class Tray:
+    def __init__(self):
+        self.bin = find_bin()
+        self._updating = False  # 程序化改控件状态时，屏蔽回调（否则会自我触发）
+        self.notice = None
+        self.notice_until = 0.0
+        self._alive = True
+        self._gpu = None  # 后台线程写入、主循环读取的缓存
+        self._gpu_lock = threading.Lock()
+
+        self.ind = AppIndicator3.Indicator.new(
+            APP_ID, pick_icon(), AppIndicator3.IndicatorCategory.HARDWARE
+        )
+        self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.ind.set_title("OMEN 控制面板")
+
+        self.menu = Gtk.Menu()
+        self._add_item("打开控制面板", self.on_open)
+        self._add_item("监控浮窗", self.on_hud)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.preset_items = {}
+        group = None
+        for key, label in PRESETS:
+            item = Gtk.RadioMenuItem(label=label, group=group)
+            if group is None:
+                group = item
+            item.connect("toggled", self.on_preset, key)
+            self.menu.append(item)
+            self.preset_items[key] = item
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.fan_item = Gtk.CheckMenuItem(label="自动风扇控制（曲线+温控）")
+        self.fan_item.connect("toggled", self.on_fan_toggle)
+        self.menu.append(self.fan_item)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.status_item = Gtk.MenuItem(label="读取中…")
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+        # 「关闭面板与托盘」= 从托盘彻底关掉这个应用（用户要求，2026-10-11）。
+        # ⚠ 与下面的「退出托盘」明确分开：**只退托盘不碰面板**这条语义要保持可预测，
+        #   否则"我只想重启一下托盘"就会顺手把正在看的面板也关掉。
+        # 面板没在跑时它会置灰（见 refresh）—— 免得点了一个"什么也没发生"的项。
+        self.close_all_item = self._add_item("关闭面板与托盘", self.on_close_all)
+        self._add_item("退出托盘", self.on_quit)
+
+        self.menu.show_all()
+        self.ind.set_menu(self.menu)
+
+        # GPU 读数由独立线程刷（nvidia-smi 起进程，不能放主循环）；没有 N 卡就不起。
+        if gpu_present():
+            threading.Thread(target=self._gpu_loop, daemon=True).start()
+
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_SECS, self.refresh)
+
+    def _gpu_loop(self):
+        while self._alive:
+            data = gpu_query()
+            with self._gpu_lock:
+                self._gpu = data
+            # 分片睡，退出时能及时收工（daemon 线程也无妨，只是别白跑一次 nvidia-smi）
+            for _ in range(GPU_REFRESH_SECS * 2):
+                if not self._alive:
+                    return
+                time.sleep(0.5)
+
+    def _add_item(self, label, cb):
+        item = Gtk.MenuItem(label=label)
+        item.connect("activate", cb)
+        self.menu.append(item)
+        return item
+
+    # ------------------------------------------------------------ 菜单动作
+    def on_open(self, *_):
+        self._spawn([self.bin] if self.bin else [])
+
+    def on_hud(self, *_):
+        if self.bin:
+            self._spawn([self.bin, "--hud"])
+
+    def on_preset(self, item, key):
+        if self._updating or not item.get_active():
+            return
+        if not self.bin:
+            self._set_notice("找不到 omen-control 可执行文件")
+            return
+        label = dict(PRESETS).get(key, key)
+        self._run_async([self.bin, "--set-preset", key], ok_msg="已切到「%s」" % label)
+
+    def on_fan_toggle(self, item):
+        if self._updating:
+            return
+        want = item.get_active()
+        helper = find_helper()
+        if not helper:
+            self._set_notice("未安装免密组件，无法切换守护")
+            self.refresh()
+            return
+        sub = ["set-fan-daemon", "on" if want else "off"]
+        ok_msg = "风扇守护已%s" % ("开启" if want else "关闭")
+
+        def worker():
+            code, msg = 1, ""
+            try:
+                r = subprocess.run(
+                    ["sudo", "-n", helper] + sub,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    timeout=20,
+                )
+                code = r.returncode
+                msg = r.stdout.decode("utf-8", "replace").strip()
+            except Exception as exc:
+                msg = str(exc)
+            # 免密没配好时，才退回 pkexec（会弹一次密码框）。
+            #
+            # ⚠⚠ 判据必须是「**是不是授权问题**」，不能是「是不是非 0 退出」
+            #   —— 2026-10-11 实测踩到：helper 因**功能**原因失败（omen-fand.service
+            #   的 ConditionPathExists 未满足、被 systemd 跳过，以 5 退出）也会非 0，
+            #   旧代码于是弹了一个**输密码也解决不了**的密码框，用户看到的现象就是
+            #   「不是免密吗？怎么还输密码」，紧接着一条"启停失败"。
+            #
+            # 判据用**退出码**，不匹配文案（文案随 locale 变）：
+            #   · `sudo -n` 在"没配免密"时**自己**以 1 退出（"interactive
+            #     authentication is required" —— 文案随 locale 变，不能拿来匹配）；
+            #   · helper 自己的失败一律 >=2（2 参数错 / 3 写失败 / 4 找不到节点 /
+            #     5 服务未达到期望状态），这类**输密码也解决不了**。
+            if code == 1 and "[错误]" not in msg and which("pkexec"):
+                try:
+                    code = subprocess.run(["pkexec", helper] + sub, timeout=120).returncode
+                    msg = "" if code == 0 else "pkexec 未获授权"
+                except Exception as exc:
+                    msg = str(exc)
+
+            def done():
+                if code == 0:
+                    self._set_notice(ok_msg)
+                else:
+                    self._set_notice("切换失败：%s" % (msg.splitlines()[-1] if msg else "未知错误"))
+                self.refresh()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_close_all(self, *_):
+        """先关面板、再退托盘 —— 从托盘彻底关掉这个应用。"""
+        for pid in panel_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        self._alive = False
+        Gtk.main_quit()
+
+    def on_quit(self, *_):
+        # 只退托盘，不碰面板（保持这条语义可预测）
+        self._alive = False
+        Gtk.main_quit()
+
+    # ------------------------------------------------------------ 辅助
+    def _spawn(self, argv):
+        if not argv:
+            self._set_notice("找不到 omen-control 可执行文件")
+            return
+        try:
+            subprocess.Popen(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self._set_notice("启动失败：%s" % exc)
+
+    def _run_async(self, argv, ok_msg=None):
+        """后台跑一条命令（提权调用约 100~200ms，别卡住 GTK 主循环）。"""
+
+        def worker():
+            code, msg = 1, ""
+            try:
+                r = subprocess.run(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                code = r.returncode
+                lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+                msg = lines[-1] if lines else ""
+            except Exception as exc:
+                msg = str(exc)
+
+            def done():
+                if code == 0:
+                    if ok_msg:
+                        self._set_notice(ok_msg)
+                else:
+                    self._set_notice("失败：%s" % (msg or " ".join(argv[1:])))
+                self.refresh()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_notice(self, text):
+        self.notice = text
+        self.notice_until = time.time() + NOTICE_SECS
+        self._render_status(cpu_temp(), fan_rpms())
+
+    # ------------------------------------------------------------ 刷新
+    def refresh(self):
+        temp = cpu_temp()
+        fans = fan_rpms()
+        self._render_status(temp, fans)
+
+        preset = read_preset()
+        if preset in self.preset_items:
+            self._updating = True
+            try:
+                self.preset_items[preset].set_active(True)
+            finally:
+                self._updating = False
+
+        active = fan_daemon_active()
+        self._updating = True
+        try:
+            self.fan_item.set_active(active)
+        finally:
+            self._updating = False
+
+        # 「关闭面板与托盘」只在**面板真在跑**时可用 —— 否则它和「退出托盘」
+        # 完全等价，点了会让人以为"没生效"。置灰本身就说明了"面板现在没开"。
+        self.close_all_item.set_sensitive(bool(panel_pids()))
+
+        return True  # 继续定时刷新
+
+    def _render_status(self, temp, fans):
+        if self.notice and time.time() < self.notice_until:
+            self.status_item.set_label(self.notice)
+            return
+        self.notice = None
+
+        with self._gpu_lock:
+            gpu = self._gpu
+
+        parts = []
+        if temp is not None:
+            parts.append("CPU %.0f°C" % temp)
+        if gpu and gpu.get("temp") is not None:
+            # 有 N 卡却没有读数（驱动刚启/查询超时）时不占位，避免显示 "GPU —°C"
+            parts.append("GPU %.0f°C" % gpu["temp"])
+        if fans:
+            # 逐风扇列出：只显示 max 会掩盖"一个高一个低"——
+            # 本机 fan0 是 CPU、fan1 是 GPU（实测常态 fan0 > fan1），
+            # 但反过来时（GPU 满载）也需要能看出来。
+            parts.append("风扇 %s RPM" % "/".join(str(f) for f in fans))
+        # 模块没就绪时明说一句：否则"风扇不转"会被误读成"曲线没生效"。
+        # 内核升级后自动重建失败时就是这个状态（omen-wmi-build 在 journal 里报错，
+        # 但用户不会去翻 journal）。
+        if not os.path.exists("/sys/devices/platform/omen-wmi/fan_speed"):
+            parts.append("⚠ 风扇模块未就绪")
+        self.status_item.set_label("  ·  ".join(parts) if parts else "读不到温度/转速")
+
+        # 顶栏文字：GNOME 的 ubuntu-appindicators 扩展**会**渲染 label
+        #（indicatorStatusIcon.js 的 _updateLabel → St.Label），KDE 也显示。
+        # 2026-10-20 更正：原注释写"只显示图标、不显示它"，读了扩展源码后证伪。
+        #
+        # 2026-10-20 起带上风扇转速：温度一个数字看不出"风扇在不在吼"，
+        # 而风扇才是这台机器吵不吵的直接指标。
+        # 注意显示的是 **CPU** 温度（不是 CPU/GPU 取高）—— GPU 读数在
+        # 后台线程里，频率低且可能超时，放进顶栏会出现"时有时无"的抖动。
+        try:
+            bar = []
+            if temp is not None:
+                bar.append("%.0f°C" % temp)
+            if fans:
+                bar.append("%d RPM" % max(fans))
+            self.ind.set_label(" · ".join(bar), "")
+            tip = list(parts) if parts else ["读不到温度/转速"]
+            self.ind.set_title("OMEN — " + "  ·  ".join(tip))
+        except Exception:
+            pass
+
+
+def main():
+    if already_running():
+        sys.stderr.write("omen-tray: 已在运行，退出本次启动。\n")
+        return 0
+    Tray()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

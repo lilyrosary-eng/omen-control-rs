@@ -1,0 +1,29 @@
+[package]
+name = "omen-control"
+version = "0.2.15"
+edition = "2021"
+rust-version = "1.85"
+description = "HP OMEN Linux 安全控制面板 (仅用内核官方接口, 不写 EC)"
+license = "MIT"
+default-run = "omen-control"
+
+[[bin]]
+name = "omen-control"
+path = "src/main.rs"
+
+[dependencies]
+# v4_12 = CssProvider::load_from_string（浮窗用它动态改窗口底色 alpha）。
+# 系统 GTK 是 4.22，满足该 API 的版本要求。
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+# v1_7 = 启用 AdwToggleGroup（1.7 引入）以及 AdwAboutDialog / AdwAlertDialog（1.5 引入）。
+# feature 逐级累积：v1_7 ⊃ v1_6 ⊃ v1_5 ⊃ …，所以只写最高的一档即可。
+# 不开足 feature 时这些类型不会被导出，会报 unresolved import。
+adw = { package = "libadwaita", version = "0.9", features = ["v1_7"] }
+# 只为 --fan-daemon 注册 SIGINT/SIGTERM（保证 Ctrl-C 也走"交回固件"收尾）。
+# 已在 gtk4 的传递依赖树里，不会带来额外编译负担。
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

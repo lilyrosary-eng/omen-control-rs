@@ -1,0 +1,345 @@
+#!/bin/bash
+# ============================================================================
+# omen-control-helper —— OMEN 控制面板的唯一提权入口
+#
+# 由 /etc/sudoers.d/omen-control 授予 NOPASSWD 权限（**仅此一个脚本**）。
+# 设计原则：只做白名单操作，参数逐项字面量 / 范围校验，绝不接受任意命令。
+# 因此即使被本地用户直接调用，也无法执行白名单之外的任何东西。
+#
+# 安全要求（由 setup-nopasswd.sh 保证）：
+#   - 本文件属主 root:root，权限 0755，普通用户不可写
+#   - 所在目录 /usr/libexec/omen-control 同样 root:root 0755
+#
+# 子命令（**只保留实测确实生效的**）：
+#   set-maxfan    <on|off>                            hp-wmi pwm1_enable
+#   set-cpu-pct   <20..100>                           intel_pstate max_perf_pct
+#   set-epp       <default|performance|balance_performance|balance_power|power>
+#   set-turbo     <on|off>                            intel_pstate no_turbo
+#   set-cpu-freq  <400000..6000000>                   各 CPU scaling_max_freq (kHz)
+#   set-rapl      <5..200>                            intel-rapl PL1 + PL2 (W)
+#   set-gpu-clk   <min,max|off>                       nvidia-smi -lgc / -rgc
+#   set-fan-daemon <on|off|restart>                   systemctl omen-fand.service
+#
+# 【已移除：set-governor】—— 2026-10-11
+#   它管的是 omen-thermal.service（旧的分级散热守护）。该分组早已从界面删除，
+#   代码里**没有任何调用者**，系统里也没有 omen-thermal.service。
+#   按项目自己的硬规则「每移除一个功能就同步删除对应的 helper 子命令 ——
+#   不为做不到的事保留 root 权限」，这里把它删掉，不留一条没人用的提权面。
+#
+# 全部为内核 / 驱动官方接口，**不读写 EC 寄存器**。
+#
+# 关于 set-rapl 的范围（2026-10-11 实测更正）：本机 `constraint_0_max_power_uw` 读 55 W
+# 而 BIOS 实设 135 W —— 但 intel-rapl **写入并不 clamp**，
+# 那个节点只是 BIOS 报的能力值。所以范围给 5..200 W，并在写后**读回校验**；
+# 真被固件/系统服务覆盖就明确报错，而不是静默成功。
+#
+# 【已移除的子命令，原因见 README「实测结论」】
+#   set-profile   —— ACPI platform_profile 在本机（主板 8A1A 未被内核识别，
+#                    连 torvalds/linux 主线板子表里都没有）写下去对硬件零影响。
+#   set-gpu-power —— nvidia-smi -pl 在本机是**空操作**：返回 0 但
+#                    `Current Power Limit` 与实测 `power.draw` 均不跟随
+#                    （写 40 W 仍跑出 80 W 峰值）。TGP 由平台 vBIOS 锁定；
+#                    真正改 TGP 的 cTGP 机制是内核态 WMI 命令
+#                    (HPWMI_SET_GPU_THERMAL_MODES_QUERY)，Linux 无用户态接口。
+#
+# 【2026-10-09 新增 set-gpu-clk —— 更正上面那条「GPU 管不了」的结论】
+#   **功耗墙（-pl）走不通 ≠ GPU 管不了。** 锁 SM 时钟（`-lgc`）是完全不同的机制，
+#   实测有效且可逆：
+#       sudo nvidia-smi -lgc 210,1500   → 被接受
+#       守护器日志：temp=76C power=130.50W sm=1875MHz -> lock 1200MHz
+#       结果：71°C / 57.39 W（功耗降 56%）
+#   `-rgc` 解锁。所以把这条写权限补回来 —— UI 对应「GPU」组里的「锁定核心频率」。
+# ============================================================================
+
+set -euo pipefail
+
+CPU_CPUFREQ_GLOB="/sys/devices/system/cpu/cpu[0-9]*/cpufreq"
+PSTATE="/sys/devices/system/cpu/intel_pstate"
+# RAPL_* 在 set-rapl 分支内定义（需要动态读取 max 上限）
+
+HWMON_ROOT="/sys/devices/platform/hp-wmi/hwmon"
+
+usage() {
+    echo "用法: omen-control-helper <子命令> [参数]" >&2
+    echo "  set-maxfan    on|off" >&2
+    echo "  set-cpu-pct   20..100" >&2
+    echo "  set-epp       default|performance|balance_performance|balance_power|power" >&2
+    echo "  set-turbo     on|off" >&2
+    echo "  set-cpu-freq  400000..6000000  (kHz)" >&2
+    echo "  set-rapl      5..200           (W，同时写 PL1 与 PL2)" >&2
+    echo "  set-gpu-clk   min,max | off    (MHz，如 210,1500)" >&2
+    echo "  set-fan-daemon on | off | restart" >&2
+    exit 2
+}
+
+# is_int <值> <下界> <上界>：必须是纯数字且落在闭区间内
+is_int() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+  [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+# verify_unit <unit> <active|inactive>：写后校验服务的**真实**状态。
+#
+# 为什么必须有它（2026-10-11 实测踩到，用户侧的"开关点了没反应"）：
+#   `systemctl start` 对"启动条件未满足而被跳过"的 unit **也返回 0**。
+#   本机 omen-fand.service 带 `ConditionPathExists=/sys/devices/platform/omen-wmi/fan_speed`，
+#   内核模块缺这个节点时 systemd 直接判 skipped —— 于是只看退出码就会**谎报成功**，
+#   界面显示"已开启"而实际什么都没跑。必须回头问 `is-active` 才算数。
+verify_unit() {
+  local unit="$1" want="$2" st="" ok=0
+  for _ in {1..10}; do
+    st=$(systemctl is-active "$unit" 2>/dev/null || true)
+    ok=0
+    case "$want:$st" in
+      active:active)     ok=1 ;;
+      inactive:inactive) ok=1 ;;
+      inactive:failed)   ok=1 ;;
+    esac
+    if [ "$ok" -eq 1 ]; then
+      echo "[完成] $unit = $st"
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "[错误] $unit 未达到期望状态：期望 $want，实际 ${st:-未知}" >&2
+  local cond
+  cond=$(systemctl show "$unit" -p ConditionResult 2>/dev/null | cut -d= -f2 || true)
+  if [ "$cond" = "no" ]; then
+    echo "        原因：unit 的启动条件未满足（ConditionResult=no）。" >&2
+    echo "        常见于内核模块没加载 / 依赖节点缺失；详见下面的 status。" >&2
+  fi
+  systemctl --no-pager status "$unit" 2>&1 | sed -n '1,10p' | sed 's/^/        /' >&2 || true
+  return 1
+}
+
+# ensure_fan_node：确保 /sys/devices/platform/omen-wmi/fan_speed 存在。
+#
+# 为什么 helper 要管这件事（用户实测：界面开关点了就弹回去）：
+#   fan_speed 由 hp-wmi-omen 内核模块提供。模块没加载、或加载的是**旧版 .ko**
+#   （只创建 11 个属性、独缺 fan_speed）时，omen-fand.service 的
+#   ConditionPathExists 直接判 no ⇒ `systemctl start` 返回 0 但服务被 skip，
+#   界面上就是"开了又自己关"。
+#
+# 让用户为此去开终端 modprobe 是最差体验，所以这里先自己补：
+#   ① 没加载 → modprobe
+#   ② 已加载但没节点 → rmmod + modprobe（换掉 initramfs 里的旧副本）
+#   ③ 修 sysfs 属组（plugdev 可写）并等节点出现
+# 三步都失败才报错 —— 那说明磁盘上的 .ko 本身就不对，只能重新 build。
+ensure_fan_node() {
+  local node=/sys/devices/platform/omen-wmi/fan_speed i
+  [ -e "$node" ] && return 0
+
+  # 情况 A：模块没加载
+  modprobe hp-wmi-omen 2>/dev/null || true
+
+  # 情况 B（实测踩到的真根因）：模块**已加载**但没有 fan_speed。
+  #   这几乎总是因为开机时 systemd-modules-load 从 **initramfs** 里加载了旧副本
+  #   （Ubuntu 默认 MODULES=most 会把 extra/ 下的第三方模块也打进去），
+  #   而磁盘上的 .ko 早就换成新版了 —— 于是"手动 rebuild 就能用、一重启又坏"。
+  #   这里把内存里的旧实例换掉：rmmod 后重新 modprobe 会读磁盘上的版本。
+  #   refcount 为 0 时才卸得掉；有别人用着就跳过，不会硬来。
+  if [ -d /sys/module/hp_wmi_omen ] && [ ! -e "$node" ]; then
+    rmmod hp_wmi_omen 2>/dev/null && {
+      modprobe hp-wmi-omen 2>/dev/null || true
+    }
+  fi
+
+  systemctl start omen-wmi-perm.service 2>/dev/null || true
+
+  for i in $(seq 1 10); do
+    [ -e "$node" ] && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+# 失败时给出**可执行**的诊断，而不是只说"失败了"。
+explain_missing_node() {
+  echo "[错误] 缺少 /sys/devices/platform/omen-wmi/fan_speed" >&2
+  if [ -d /sys/module/hp_wmi_omen ]; then
+    echo "        模块已加载，但没有 fan_speed 节点 ⇒ 装的是**旧版** .ko。" >&2
+    echo "        修：sudo bash <仓库>/omen-wmi-omen/install.sh --build" >&2
+    echo "        （源码里该节点是有的；旧 .ko 只创建了 11 个属性）" >&2
+  else
+    echo "        hp-wmi-omen 模块未加载，且 modprobe 失败。" >&2
+    echo "        查：sudo modprobe -v hp-wmi-omen; dmesg | tail -20" >&2
+  fi
+}
+
+[ "$#" -ge 1 ] || usage
+CMD="$1"; shift
+
+case "$CMD" in
+
+  set-maxfan)
+    [ "$#" -eq 1 ] || usage
+    case "$1" in on) VALUE=0 ;; off) VALUE=2 ;; *) echo "非法参数: $1" >&2; exit 2 ;; esac
+    COUNT=0
+    for node in "$HWMON_ROOT"/hwmon*/pwm*_enable; do
+      [ -e "$node" ] || continue
+      printf '%s\n' "$VALUE" > "$node"
+      COUNT=$((COUNT + 1))
+    done
+    [ "$COUNT" -gt 0 ] || { echo "未找到 hp-wmi pwm 控制节点" >&2; exit 4; }
+    ;;
+
+  set-cpu-pct)
+    # 限制 CPU 最大性能百分比 —— 最安全、完全可逆的"限功耗降温"手段
+    [ "$#" -eq 1 ] || usage
+    is_int "$1" 20 100 || { echo "数值需在 20..100" >&2; exit 2; }
+    printf '%s\n' "$1" > "$PSTATE/max_perf_pct"
+    ;;
+
+  set-epp)
+    [ "$#" -eq 1 ] || usage
+    case "$1" in
+      default|performance|balance_performance|balance_power|power) : ;;
+      *) echo "非法 EPP 值: $1" >&2; exit 2 ;;
+    esac
+    COUNT=0
+    for node in $CPU_CPUFREQ_GLOB/energy_performance_preference; do
+      [ -w "$node" ] || continue
+      printf '%s\n' "$1" > "$node"
+      COUNT=$((COUNT + 1))
+    done
+    [ "$COUNT" -gt 0 ] || { echo "未找到可写的 EPP 节点" >&2; exit 4; }
+    ;;
+
+  set-turbo)
+    [ "$#" -eq 1 ] || usage
+    case "$1" in on) VALUE=0 ;; off) VALUE=1 ;; *) echo "非法参数: $1" >&2; exit 2 ;; esac
+    printf '%s\n' "$VALUE" > "$PSTATE/no_turbo"
+    ;;
+
+  set-cpu-freq)
+    [ "$#" -eq 1 ] || usage
+    is_int "$1" 400000 6000000 || { echo "频率需在 400000..6000000 kHz" >&2; exit 2; }
+    COUNT=0
+    for node in $CPU_CPUFREQ_GLOB/scaling_max_freq; do
+      [ -w "$node" ] || continue
+      printf '%s\n' "$1" > "$node"
+      COUNT=$((COUNT + 1))
+    done
+    [ "$COUNT" -gt 0 ] || { echo "未找到可写的频率节点" >&2; exit 4; }
+    ;;
+
+  set-rapl)
+    # ⚠ 不再拿 `constraint_0_max_power_uw` 当"可写上限"。
+    #   本机它读 55 W，而同一时刻 `power_limit_uw` 实际是 **135 W** ——
+    #   若 55 真是钳位上限，135 根本不可能存在。intel-rapl 写入并不 clamp，
+    #   那个节点只是 BIOS 报的能力值。旧判断把控件误禁成了「PL1 锁死 55W 不可调」。
+    #   改成：允许 5..200 W，**写后读回**，真被钳/被覆盖就明确报出来。
+    #
+    # ⚠⚠ 为什么必须**连 PL2 一起写**（2026-10-11 实测：用户报"限 30W 仍 99°C"的根因之一）
+    #   constraint_0 = long_term（PL1），它按**约 56 秒的窗口做平均**：
+    #   本机 constraint_0_time_window_us 读 55967744，而该节点权限是 -r--r--r--
+    #   （**只读**），没法把窗口改短。于是"只写 PL1"时，CPU 仍可按 BIOS 的
+    #   short_term（constraint_1 = 135 W）连续睿频几十秒 —— 实测 PL1=30 W 下：
+    #   t=0..24s 稳定 84°C，到 t=27s 才掉到 58°C（前 24 秒等于没限）。
+    #   把 constraint_1 也压到同一个值，才真正是"硬墙"。
+    #   constraint_2 = peak_power（215 W）**保持不动**：它只管微秒级瞬时尖峰，
+    #   压得过低反而会让 CPU 频繁硬降频，得不偿失。
+    [ "$#" -eq 1 ] || usage
+    is_int "$1" 5 200 || { echo "功耗需在 5..200 W" >&2; exit 2; }
+    MICRO_W=$(( $1 * 1000000 ))
+    RAPL="/sys/class/powercap/intel-rapl:0"
+    RAPL_MMIO="/sys/class/powercap/intel-rapl-mmio:0"
+    PL1="$RAPL/constraint_0_power_limit_uw"
+    PL2="$RAPL/constraint_1_power_limit_uw"
+    PL1_MMIO="$RAPL_MMIO/constraint_0_power_limit_uw"
+    PL2_MMIO="$RAPL_MMIO/constraint_1_power_limit_uw"
+    printf '%s\n' "$MICRO_W" > "$PL1" || { echo "写入 $PL1 失败" >&2; exit 3; }
+    # 同一个封装级功耗墙在 MMIO 域还有一份，跟着写，避免只改一半
+    [ -w "$PL1_MMIO" ] && printf '%s\n' "$MICRO_W" > "$PL1_MMIO" 2>/dev/null || true
+    # PL2（short_term）：不写它等于没限住睿频
+    [ -w "$PL2" ] && printf '%s\n' "$MICRO_W" > "$PL2" 2>/dev/null || true
+    [ -w "$PL2_MMIO" ] && printf '%s\n' "$MICRO_W" > "$PL2_MMIO" 2>/dev/null || true
+    # 写后读回：被内核/固件钳位、或被 thermald/ppd 立刻改回时，明确报出来
+    # （而不是"静默成功"——那正是旧实现给人"选了也不生效"印象的原因）
+    BACK1=$(cat "$PL1" 2>/dev/null || echo 0); BACK1=$(( BACK1 / 1000000 ))
+    BACK2=$(cat "$PL2" 2>/dev/null || echo 0); BACK2=$(( BACK2 / 1000000 ))
+    if [ "$BACK1" != "$1" ] || [ "$BACK2" != "$1" ]; then
+      echo "写入未完全保持：目标 $1 W，读回 PL1=${BACK1} W / PL2=${BACK2} W" >&2
+      echo "  （PL1 未保持＝被 thermald/ppd 覆盖或超固件允许范围；PL2 未保持＝固件不接受该域）" >&2
+      exit 4
+    fi
+    echo "[完成] PL1=${BACK1} W · PL2=${BACK2} W"
+    ;;
+
+  set-gpu-clk)
+    # ── 锁 GPU 核心（SM）时钟：本机**唯一**实测有效的 GPU 降温杠杆 ──
+    # 与 set-gpu-power（功耗墙，空操作）是两个不同机制，别混。
+    # 实测 210,1500 → GPU 功耗 130.5 W 降到 57.4 W；-rgc 可逆。
+    [ "$#" -eq 1 ] || usage
+    NVIDIA_SMI=/usr/bin/nvidia-smi
+    [ -x "$NVIDIA_SMI" ] || NVIDIA_SMI=$(command -v nvidia-smi || true)
+    [ -n "$NVIDIA_SMI" ] && [ -x "$NVIDIA_SMI" ] || { echo "未找到 nvidia-smi" >&2; exit 4; }
+    if [ "$1" = "off" ]; then
+      "$NVIDIA_SMI" -rgc >/dev/null 2>&1 || { echo "解锁 GPU 时钟失败" >&2; exit 4; }
+    else
+      # 只接受 "min,max" 这种严格字面量，避免把任意参数透给 nvidia-smi
+      if ! [[ "$1" =~ ^([0-9]{1,4}),([0-9]{1,4})$ ]]; then
+        echo "格式应为 min,max（例如 210,1500）或 off" >&2; exit 2
+      fi
+      MIN="${BASH_REMATCH[1]}"; MAX="${BASH_REMATCH[2]}"
+      is_int "$MIN" 0 4000 || { echo "min 需在 0..4000" >&2; exit 2; }
+      is_int "$MAX" 200 4000 || { echo "max 需在 200..4000" >&2; exit 2; }
+      [ "$MIN" -le "$MAX" ] || { echo "min 不能大于 max" >&2; exit 2; }
+      "$NVIDIA_SMI" -lgc "$MIN,$MAX" >/dev/null 2>&1 \
+        || { echo "锁定失败：驱动不接受 $MIN,$MAX" >&2; exit 4; }
+    fi
+    ;;
+
+  set-fan-daemon)
+    # ── 开关**风扇曲线守护**（omen-fand.service，非 root 运行）──
+    # 它是本工具**唯一的散热执行者**：连续风扇曲线，以及温度限制
+    # （压 CPU 上限 / PL1+PL2 / 锁 GPU 时钟）都由它按同一份温度驱动。
+    [ "$#" -eq 1 ] || usage
+    case "$1" in on|off|restart) : ;; *) echo "参数应为 on|off|restart" >&2; exit 2 ;; esac
+    command -v systemctl >/dev/null 2>&1 || { echo "未找到 systemctl" >&2; exit 4; }
+    if ! systemctl list-unit-files omen-fand.service >/dev/null 2>&1; then
+      echo "未安装 omen-fand.service（先跑 omen-control-rs/system/install-fand.sh install）" >&2
+      exit 4
+    fi
+    case "$1" in
+      on)
+        # 先把模块/节点补齐 —— 否则下面 systemctl 会"成功"但服务被 skip。
+        ensure_fan_node || { explain_missing_node; exit 5; }
+        # ⚠ 必须先 reset-failed：unit 带 StartLimitIntervalSec=60 / Burst=3，
+        #   启动失败 3 次就进 start-limit-hit 锁死 60 秒，
+        #   之后 `systemctl start` 会被直接拒绝且**不重试** ⇒ 用户表现为
+        #   "开关点了没反应 / 自动关闭"，而且怎么点都起不来。
+        #   失败原因可能早已消失（配置改好、竞争进程退出），所以解锁后再启。
+        systemctl reset-failed omen-fand.service 2>/dev/null || true
+        # enable --now：与 `off` 的 disable 对称。
+        # 只 start 不 enable 的话，之前 disable 过的单元这次"开了"但下次开机又不自启。
+        systemctl enable --now omen-fand.service
+        ;;
+      off)
+        # 用 disable 而不是 stop：UI 上那行写的是「开机自启、崩溃自动重启」，
+        # 所以"关掉"必须是**持久关闭**。只 stop 的话重启后 systemd 又会把它拉起来，
+        # 用户看到的是"我明明关了，怎么又自己开了"—— 正是「自动关闭」 complaints 的另一半。
+        systemctl disable --now omen-fand.service
+        systemctl reset-failed omen-fand.service 2>/dev/null || true
+        ;;
+      restart)
+        ensure_fan_node || { explain_missing_node; exit 5; }
+        systemctl reset-failed omen-fand.service 2>/dev/null || true
+        systemctl restart omen-fand.service
+        ;;
+    esac
+    # 写后校验真实状态 —— 关键：unit 带 ConditionPathExists，
+    # 条件不满足时 `systemctl start` 也返回 0，不校验就会谎报成功（实测踩到）。
+    case "$1" in
+      on|restart) verify_unit omen-fand.service active   || exit 5 ;;
+      off)        verify_unit omen-fand.service inactive || exit 5 ;;
+    esac
+    ;;
+
+
+  *)
+    usage
+    ;;
+esac
+
+exit 0

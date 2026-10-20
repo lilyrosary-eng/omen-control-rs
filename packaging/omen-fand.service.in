@@ -1,0 +1,42 @@
+[Unit]
+Description=OMEN 风扇曲线守护（omen-control --fan-daemon）
+# ⚠ 路径必须是纯 ASCII：含中文的 file:// 会被 systemd 判为 Invalid URL（实测）
+Documentation=file:///usr/share/doc/omen-control/README.md
+# omen-wmi 模块没加载时直接跳过，不要反复失败刷日志
+ConditionPathExists=/sys/devices/platform/omen-wmi/fan_speed
+# 崩溃循环保护：60 秒内失败超过 3 次就停下来（坏配置不会无限重启）
+StartLimitIntervalSec=60
+StartLimitBurst=3
+After=multi-user.target
+
+[Service]
+Type=simple
+
+# 以**用户身份**跑即可，不需要 root：
+#   daemon 只做两件事 —— 读温度（hwmon/世界可读）、写 fan_speed（0664 root:plugdev）。
+# 最小权限原则：万一有 bug，也动不了系统其它部分。
+User=@USER@
+
+# ⚠ systemd 的 system 服务里 $HOME 是 /root，光靠 HOME 推导会读到
+#   /root/.config/omen-control ⇒ 用户那条曲线会"消失"。
+#   必须显式给出用户的配置目录（由 postinst 按安装用户生成）。
+Environment=OMEN_CONFIG_DIR=@CONFIG_DIR@
+
+ExecStart=@BIN@ --fan-daemon --interval 2
+
+# 崩溃自动重启
+Restart=on-failure
+RestartSec=5
+
+# 收尾双保险：
+#   daemon 自己处理 SIGTERM/SIGHUP 会「写 0 + unthrottle 1→0」交回固件，
+#   这里在服务退出后再兜一次 —— 覆盖它被 SIGKILL、来不及收尾的情况。
+ExecStopPost=/bin/sh -c 'printf 0 > /sys/devices/platform/omen-wmi/fan_speed 2>/dev/null || true'
+
+# 日志进 journal：journalctl -u omen-fand [-f]
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omen-fand
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+#!/bin/sh
+# omen-control 卸载后处理。
+#
+# 要清的都是**本包脚本自己生成**的东西（不是 dpkg 的 conffile，dpkg 不会管）：
+#   · /etc/sudoers.d/omen-control —— 不清就是留了一条 root 权限面
+#   · /etc/systemd/system/omen-fand.service —— 不清会留一个指向已删二进制的 unit
+# 用户自己的设置（~/.config/omen-control/config）**不动**：那是用户数据，
+# 重装后应当还在（要清就自己 rm）。
+set -eu
+
+case "${1:-}" in
+    remove|purge)
+        rm -f /etc/sudoers.d/omen-control
+        rm -f /etc/systemd/system/omen-fand.service
+        # 托盘是**用户进程**（登录会话里跑），卸载后它会留着一个指向已删脚本的图标，
+        # 点任何菜单项都失败。这里顺手结束它（按完整路径匹配，不会误伤别的进程）。
+        # 升级（upgrade）走的是 prerm → postinst：那边由 omen-tray-restart
+        # 「杀掉旧托盘 + 用同一套会话环境拉起新的」，所以不在这里处理。
+        pkill -f "/usr/libexec/omen-control/omen-tray" 2>/dev/null || true
+        # 面板与"手动起的守护"同样按**整条命令行**收掉 ——
+        # 卸载后它们指向已删的二进制，留着只会报错/写坏状态。
+        # （不用 `pkill -x omen-control`：那会连 systemd 的守护一起误伤，
+        #   虽然这里已经 disable 了它，但没必要制造额外噪声。）
+        pkill -f '(^|/)omen-control$' 2>/dev/null || true
+        pkill -f -- '--fan-daemon' 2>/dev/null || true
+        ;;
+esac
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

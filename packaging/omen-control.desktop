@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN 控制面板
+Name[en]=OMEN Control Panel
+Comment=HP OMEN 性能档 / 风扇曲线 / 温度限制
+Comment[en]=HP OMEN power presets, fan curve and temperature limits
+# ⚠ 只指向系统安装的那一份。以前面板自己往 ~/.local/bin 再装一份，
+#   于是"菜单点开的是旧版"（实测踩过）—— 打包后由包统一提供，不再有第二份。
+Exec=/usr/bin/omen-control
+# 图标名 = hicolor 主题里的文件名（/usr/share/icons/hicolor/scalable/apps/omen-control.svg）
+Icon=omen-control
+# 让 GNOME 把「正在运行的窗口」与本条目关联起来（否则 Dock/顶栏会显示通用占位图）：
+# GTK4 在 Wayland 下把 app_id 设为 GApplication 的 id，这里要写同一个值。
+StartupWMClass=org.rosary.OmenControl
+Terminal=false
+# 只留一个主分类（写两个会被 desktop-file-validate 提示"可能重复出现"）
+Categories=System;
+Keywords=OMEN;HP;fan;thermal;power;风扇;温度;性能;
+StartupNotify=true

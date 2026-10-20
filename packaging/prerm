@@ -1,0 +1,65 @@
+#!/bin/sh
+# omen-control 卸载/升级前处理。
+#
+# 只在**真正移除**时停服务；升级（upgrade）时不停 —— 那会让风扇在升级过程中
+# 掉回固件曲线，装完 postinst 再 try-restart，中间有个没必要的抖动窗口。
+set -eu
+
+log() { echo "omen-control: $*" >&2; }
+
+# 结束**旧二进制上的同类进程**。用户明确要求（2026-10-11）：
+#   「每次升级/起服务都要把上一个同类进程杀掉，防止干扰」——
+# 这不是洁癖，是实打实踩过的坑：升级后旧面板继续运行，它的 save_config 是旧格式，
+# **没有 `cpu.pct` 这些新键**，于是它只要保存一次配置，就把用户新设的基准整行删掉，
+# 守护随即按旧基准写硬件，用户看到的是"设置莫名其妙自己变回去"。
+#
+# 只杀**面板**（`/usr/bin/omen-control` 不带参数那条）：
+#   · 守护由 systemd 管，postinst 会 try-restart 换成新二进制，这里不动它；
+#   · 托盘由 postinst 的 omen-tray-restart 负责（它需要先捞会话环境再重启，
+#     postrm 单独处理"卸载"的情形）。
+# ⚠⚠ 绝不能用 `pkill -x omen-control`：它匹配的是**进程名**（comm），
+#   而面板 / 守护 / 浮窗三者的进程名**都是** `omen-control`
+#   ⇒ 会把 systemd 正在跑的 `--fan-daemon` 一起杀掉（风扇当掉落回固件）。
+#   必须按**整条命令行**匹配"不带参数的那一条"：cmdline 恰好以 omen-control 结尾。
+#   守护的 cmdline 是 `…/omen-control --fan-daemon --interval 2`，结尾不是它，不会被误伤；
+#   托盘的 cmdline 结尾是 `omen-tray`，同样不匹配。
+#
+# 先 SIGTERM、给它最多 2 秒体面退出，还活着才 SIGKILL ——
+# 不只用 SIGTERM 是因为**收到 TERM 不等于真的退出**（主循环卡住、自定义信号处理等），
+# 于是"升级完了旧进程还在跑"，正是本轮踩到的形态。
+kill_stale_panel() {
+    command -v pgrep >/dev/null 2>&1 || return 0
+    for _pid in $(pgrep -f '(^|/)omen-control$' 2>/dev/null || true); do
+        [ "$_pid" = "$$" ] && continue
+        kill "$_pid" 2>/dev/null || continue
+        log "已结束仍在运行的旧面板进程 pid=$_pid"
+        _i=0
+        while [ "$_i" -lt 10 ] && kill -0 "$_pid" 2>/dev/null; do
+            sleep 0.2
+            _i=$((_i + 1))
+        done
+        if kill -0 "$_pid" 2>/dev/null; then
+            kill -9 "$_pid" 2>/dev/null || true
+            log "  （它没理会 SIGTERM，已强制结束）"
+        fi
+    done
+    return 0
+}
+
+case "${1:-}" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            # 先停：守护收到 SIGTERM 会「写 0 + unthrottle 1→0」把风扇交回固件，
+            # 这是本项目约定的收尾方式，不要用 kill -9 绕过它。
+            systemctl stop omen-fand.service >/dev/null 2>&1 || true
+            systemctl disable omen-fand.service >/dev/null 2>&1 || true
+        fi
+        kill_stale_panel
+        ;;
+    upgrade)
+        # 升级：守护会被 postinst try-restart 换成新的，这里只收掉旧面板。
+        kill_stale_panel
+        ;;
+esac
+
+exit 0
