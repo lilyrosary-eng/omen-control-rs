@@ -503,7 +503,7 @@ src/hud.rs         监控浮窗：独立 app id，1 s 刷新，只读
 src/limit.rs       温度限制策略（纯数据 + 纯函数，带单测；PL1/PL2、CPU 上限、GPU 锁）
 src/curve.rs       风扇曲线：温度 → 转速插值
 src/curve_editor.rs 曲线编辑器控件（拖点改曲线）
-src/omen.rs        自研内核模块 hp_wmi_omen 的接入层（风扇转速/百分比、档位、GPU 模式）
+src/omen.rs        配套内核模块 hp_wmi_omen 的接入层（模块派生自上游 hp-wmi）（风扇转速/百分比、档位、GPU 模式）
 src/fan_daemon.rs  风扇曲线守护（+ 温度限制的执行者）
 
 system/omen-control-helper   免密白名单 helper（8 个子命令；参数逐项校验）
@@ -535,6 +535,8 @@ packaging/omen-control-tray.desktop  托盘自启条目模板（装到 /etc/xdg/
 ## 许可证
 
 - 本仓库（用户态）：**MIT**，见 `LICENSE`
-- 配套内核模块 `hp-wmi-omen`：**GPL-2.0**（`MODULE_LICENSE("GPL")` 要求）
+- 配套内核模块 `hp-wmi-omen`：**GPL-2.0**（`MODULE_LICENSE("GPL")` 要求）。
+  它的 WMI 传输层与命令码表**派生自 Linux 内核 `drivers/platform/x86/hp/hp-wmi.c`**，
+  版权归上游作者；本仓库只新增 GM12 写风扇、8A1A 探测与 DMI 白名单。
 
 `OMEN` / `HP` 是 HP Inc. 的商标。本项目与 HP 无任何关联，名称仅作机型说明用途。
