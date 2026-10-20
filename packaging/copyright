@@ -3,7 +3,7 @@ Upstream-Name: omen-control
 Source: 本地自建（源码位于源码树 omen-control-rs/）
 
 Files: *
-Copyright: 2026 rosary
+Copyright: 2026 Rosary <lilyrosary0@gmail.com>
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy of
  this software and associated documentation files (the "Software"), to deal in
@@ -16,7 +16,7 @@ License: MIT
  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 Comment:
- 本包不含内核模块。风扇曲线依赖另行安装的 hp-wmi-omen 内核模块
- （源码 omen-wmi-omen/，用它的 install.sh 编译并签名），
- 因为内核模块需要按内核版本编译 + MOK 签名 + Secure Boot 确认，不适合塞进
- 本包的 postinst。
+ 本包自带 hp-wmi-omen 内核模块源码（/usr/src/hp-wmi-omen-0.1.0/），
+ 由 postinst 通过 DKMS 针对当前内核编译并签名；内核升级后 DKMS 自动重建。
+ 仅支持 HP OMEN 16-k0xxx（主板 8A1A）—— 其它机型模块会拒绝所有写操作。
+ Secure Boot 开启且本机没有已注册 MOK 时，仍需一次 --genkey + 重启确认。

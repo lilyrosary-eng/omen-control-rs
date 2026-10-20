@@ -26,6 +26,11 @@ BIN_SRC="${1:-}"
 VERSION="${2:-}"
 BUILD_TS="${3:-$(date '+%F %T %z')}"
 ARCH="$(dpkg --print-architecture)"
+
+# 内核模块仓库（默认与本身同级；可用 OMEN_KERNEL_REPO 指定）
+KERNEL_REPO="${OMEN_KERNEL_REPO:-$PROJ/../omen-wmi-omen}"
+DKMS_NAME=hp-wmi-omen
+DKMS_VER=0.1.0
 OUT_DIR="${OUT_DIR:-$PROJ/dist}"
 
 die() { echo "[错误] $*" >&2; exit 1; }
@@ -117,27 +122,43 @@ install -D -m 0755 "$PROJ/packaging/postinst" "$STAGE/DEBIAN/postinst"
 install -D -m 0755 "$PROJ/packaging/prerm"    "$STAGE/DEBIAN/prerm"
 install -D -m 0755 "$PROJ/packaging/postrm"   "$STAGE/DEBIAN/postrm"
 
+# ── 内核模块源码（DKMS 用）─────────────────────────────────────────────────
+# 没有它，装完只有 GUI、没有风扇控制 —— 所以缺源码时直接失败，不产出残包。
+if [ ! -f "$KERNEL_REPO/hp-wmi-omen.c" ] || [ ! -f "$KERNEL_REPO/dkms.conf" ]; then
+    die "找不到内核模块源码：$KERNEL_REPO（用 OMEN_KERNEL_REPO=/path/to/omen-wmi-omen 指定）"
+fi
+DKMS_DIR="$STAGE/usr/src/$DKMS_NAME-$DKMS_VER"
+install -D -m 0644 "$KERNEL_REPO/hp-wmi-omen.c" "$DKMS_DIR/hp-wmi-omen.c"
+install -D -m 0644 "$KERNEL_REPO/Makefile"      "$DKMS_DIR/Makefile"
+install -D -m 0644 "$KERNEL_REPO/dkms.conf"     "$DKMS_DIR/dkms.conf"
+install -D -m 0755 "$KERNEL_REPO/install.sh"    "$DKMS_DIR/install.sh"
+# 只读探测/诊断用；--genkey 在 Secure Boot 机器上要用到
+install -D -m 0644 "$KERNEL_REPO/README.md"     "$DKMS_DIR/README.md" 2>/dev/null || true
+
+# dkms 是硬依赖：没有它，模块源码只是躺在 /usr/src 里没人编译
+DEPS="$DEPS, dkms"
+
 SIZE="$(du -sk "$STAGE" | cut -f1)"
 
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
 Version: $VERSION
 Architecture: $ARCH
-Maintainer: rosary <rosary@localhost>
+Maintainer: Rosary <lilyrosary0@gmail.com>
 Installed-Size: $SIZE
 Depends: $DEPS
 Section: utils
 Priority: optional
-Description: HP OMEN Linux 安全控制面板（性能档 / 风扇曲线 / 温度限制）
- 通过内核官方接口控制 CPU 性能上限、睿频、频率上限、能效偏好与 CPU 功耗墙
- （PL1+PL2），并提供风扇转速、CPU/GPU 温度与频率的实时监视。
+Description: HP OMEN 16-k0xxx 控制面板（风扇曲线 / 温度限制 / 监视）
+ 仅支持 HP OMEN 16-k0xxx（主板 8A1A）。其它机型内核模块会拒绝所有写操作。
  .
- 附带系统托盘（omen-tray）：登录后常驻顶栏，可直接切档位、开关风扇守护，
- 并显示实时 CPU 温度与风扇转速。
+ 附带 hp-wmi-omen 内核模块源码（DKMS 编译）：风扇曲线经 HP 私有 WMI 命令
+ GM12 写 EC 的 SFS1/SFS2；其余设置（CPU 上限 / 睿频 / EPP / GPU 时钟锁）
+ 走内核官方接口，可逆。
  .
- 全程不读写 EC 寄存器，所有写操作都经过一个参数白名单校验的 helper，可完全回退。
+ 附带系统托盘：登录后常驻顶栏，可切档位、开关风扇守护，显示 CPU 温度与风扇转速。
  .
- 构建时间: $BUILD_TS
+ 构建时间: $BUILD_TS'
 EOF
 
 # ── 打包 ───────────────────────────────────────────────────────────────────

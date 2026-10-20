@@ -51,7 +51,11 @@ case "${1:-}" in
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             # 先停：守护收到 SIGTERM 会「写 0 + unthrottle 1→0」把风扇交回固件，
             # 这是本项目约定的收尾方式，不要用 kill -9 绕过它。
+            # 先停守护再摘模块：反过来会让守护对着消失的 fan_speed 反复报错
             systemctl stop omen-fand.service >/dev/null 2>&1 || true
+            if command -v dkms >/dev/null 2>&1; then
+                dkms remove -m hp-wmi-omen -v 0.1.0 --all >/dev/null 2>&1 || true
+            fi
             systemctl disable omen-fand.service >/dev/null 2>&1 || true
         fi
         kill_stale_panel

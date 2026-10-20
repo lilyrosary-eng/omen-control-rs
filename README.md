@@ -1,5 +1,9 @@
 # OMEN 控制面板 (Rust + GTK4)
 
+> **仅支持 HP OMEN 16-k0xxx（主板 8A1A，本机 BIOS F.23）。**
+> 其它机型的写操作会被内核模块直接拒绝（只读模式）；没有第二台机器验证过的功能，
+> 本项目不会声称支持。
+
 HP OMEN 笔记本在 Linux 上的性能与散热控制面板 + 监视浮窗。
 
 > ## 安全边界（2026-10-20 更正）
@@ -25,8 +29,8 @@ HP OMEN 笔记本在 Linux 上的性能与散热控制面板 + 监视浮窗。
 
 > **仓库布局**：两个仓库请并排放置（安装脚本按同级目录找模块源码）：
 > ```bash
-> git clone https://github.com/<you>/omen-wmi-omen.git
-> git clone https://github.com/<you>/omen-control-rs.git
+> git clone https://github.com/lilyrosary-eng/omen-wmi-omen.git
+> git clone https://github.com/lilyrosary-eng/omen-control-rs.git
 > ```
 > 也可用 `OMEN_KERNEL_REPO=/path/to/omen-wmi-omen` 指定别的位置。
 

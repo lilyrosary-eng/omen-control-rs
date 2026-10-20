@@ -71,12 +71,61 @@ if [ -n "$TARGET_USER" ] && [ -f "$UNIT_TPL" ]; then
     fi
 fi
 
+# ------------------------------------------------------- 2.5) DKMS 内核模块
+#
+# 风扇控制依赖 hp-wmi-omen 模块。源码已随包放在 /usr/src/hp-wmi-omen-<ver>，
+# 这里针对**当前运行内核**编译并安装；以后内核升级由 DKMS 自动重建。
+#
+# 必须在 systemctl start omen-fand 之前完成 —— omen-fand.service 带
+# ConditionPathExists=/sys/devices/platform/omen-wmi/fan_speed，
+# 模块没装好时会被 systemd 直接 skip（不是 failed，界面上表现为"开关打不开"）。
+DKMS_NAME=hp-wmi-omen
+DKMS_VER=0.1.0
+DKMS_SRC="/usr/src/$DKMS_NAME-$DKMS_VER"
+KREL="$(uname -r)"
+
+if [ -d "$DKMS_SRC" ]; then
+    if ! command -v dkms >/dev/null 2>&1; then
+        log "未安装 dkms —— 风扇控制不可用（监视与内核级设置仍可用）"
+        log "  修：sudo apt install dkms && sudo dpkg-reconfigure $PKG"
+    elif [ ! -d "/lib/modules/$KREL/build" ]; then
+        log "缺少当前内核头文件，模块未编译"
+        log "  修：sudo apt install linux-headers-$KREL && sudo dpkg-reconfigure $PKG"
+    else
+        dkms add -m "$DKMS_NAME" -v "$DKMS_VER" >/dev/null 2>&1 || true
+        if dkms build -m "$DKMS_NAME" -v "$DKMS_VER" >/dev/null 2>&1 &&
+           dkms install --force -m "$DKMS_NAME" -v "$DKMS_VER" >/dev/null 2>&1; then
+            log "内核模块已编译并安装（$DKMS_NAME/$DKMS_VER，内核 $KREL）"
+            depmod -a "$KREL" >/dev/null 2>&1 || true
+            modprobe "$DKMS_NAME" 2>/dev/null || true
+        else
+            log "警告：模块编译/安装失败，日志：/var/lib/dkms/$DKMS_NAME/$DKMS_VER/build/make.log"
+        fi
+    fi
+
+    # Secure Boot 的硬限制：DKMS 只能用**本机已注册**的 MOK 签名。
+    # 没有的话模块会编出来但加载不了 —— 这一步无法全自动（enroll 要重启 + 蓝屏确认）。
+    if [ -d /sys/firmware/efi ] && command -v mokutil >/dev/null 2>&1; then
+        if mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+            if [ ! -f /var/lib/shim-signed/mok/MOK.der ] ||
+               ! mokutil --test-key /var/lib/shim-signed/mok/MOK.der >/dev/null 2>&1; then
+                log "Secure Boot 已开启，且本机没有已注册的 MOK 签名密钥。"
+                log "  模块可能无法加载。一次性处理："
+                log "    sudo bash $DKMS_SRC/install.sh --genkey"
+                log "    sudo reboot    # 在蓝色 MOK 界面确认导入（只需一次）"
+            fi
+        fi
+    fi
+fi
+
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable omen-fand.service >/dev/null 2>&1 || true
     # 升级场景：正在跑的守护持有的是**旧二进制的 inode**，必须重启才会换成新的。
     # try-restart = 只在它当前是 active 时才重启，全新安装时不会无端拉起来。
-    systemctl try-restart omen-fand.service >/dev/null 2>&1 || true
+    # 升级：重启持有旧 inode 的守护；全新安装：模块就绪后直接启动。
+    systemctl try-restart omen-fand.service >/dev/null 2>&1 \
+        || systemctl start omen-fand.service >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------- 3) 移开历史副本
