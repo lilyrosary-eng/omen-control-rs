@@ -1352,19 +1352,6 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config"))
 }
 
-/// 配置里是否**显式**存在某个键。
-///
-/// 用来区分"用户没配过"与"用户配成了 0/false"——新增配置项时，
-/// 老配置文件里没有这个键，若直接读成 `false` 会让行为在升级后突然改变。
-pub fn config_has_key(key: &str) -> bool {
-    let Some(p) = config_path() else { return false };
-    let Ok(text) = fs::read_to_string(&p) else { return false };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == key))
-}
-
 /// 读取配置。文件不存在或格式异常时返回默认值，**不报错**——配置文件坏了
 /// 不该让程序起不来。
 pub fn load_config() -> Config {
@@ -1635,6 +1622,36 @@ pub fn recover_if_pending() -> Option<Snapshot> {
     let _ = snap.restore();
     let _ = fs::remove_file(&p);
     Some(snap)
+}
+
+/// 本次登录是否已经自动套用过档位。
+///
+/// 标记放在 `XDG_RUNTIME_DIR`（`/run/user/<uid>`）而不是 `~/.config`：
+/// 前者由 systemd 在**注销时**清掉，语义正好是"每次登录一次"；
+/// 后者会跨登录永久生效，等于再也不会自动套用。
+///
+/// 为什么需要它（2026-10-25 实测）：旧实现把"面板启动"当成"登录"，
+/// 于是**每次打开面板**都会重放一遍档位 —— 用户手动关掉的睿频被写回 `on`，
+/// 看起来像"关闭面板后设置自己变了"。
+pub fn auto_apply_done() -> bool {
+    auto_apply_stamp().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// 记下"本次登录已套用"，避免再次打开面板时重放。
+pub fn mark_auto_apply_done() {
+    if let Some(p) = auto_apply_stamp() {
+        if let Some(dir) = p.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(&p, b"1");
+    }
+}
+
+fn auto_apply_stamp() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(base.join("omen-control-auto-apply.done"))
 }
 
 /// 创建 / 删除浮窗的开机自启项。
@@ -2053,8 +2070,6 @@ mod tests {
         assert_eq!(back.preset.as_deref(), Some("balanced"));
         assert_eq!(back.cpu_pct, Some(80), "设定上限必须原样读回");
         assert_eq!(back.cpu_pl1, Some(45), "设定功耗墙必须原样读回");
-        assert!(super::config_has_key("cpu.pct"));
-        assert!(super::config_has_key("cpu.pl1"));
 
         // 用户设的基准优先于档位声明 —— 守护与界面都靠这条链取值（上面设的 preset 是 balanced=100）
         assert_eq!(super::cpu_base_pct(), 80);

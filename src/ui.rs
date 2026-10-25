@@ -226,6 +226,11 @@ pub fn run() {
     // 如果在 run() 开头无条件做恢复，那些"秒退的第二个进程"会把主实例刚写下的
     // pending 标记消费掉，导致真正需要恢复时已经没有标记了。
     app.connect_startup(|_| {
+        if !hw::load_config().restore_on_exit {
+            // 没开"退出时还原"：残留的 pending 只清理，**不写回任何值**。
+            hw::clear_pending();
+            return;
+        }
         if let Some(snap) = hw::recover_if_pending() {
             eprintln!(
                 "[omen-control] 检测到上次未正常退出，已把系统还原为上次启动时的状态 \
@@ -607,7 +612,7 @@ pub fn build_window(app: &adw::Application) -> ApplicationWindow {
     let boot_preset = cfg.preset.clone();
     // 默认开启"退出时还原"（用户明确要求"关掉就清零"）；老配置没有这个键，
     // 首次读到 false 会让行为突变，所以按"键缺失 = 默认开"处理。
-    let restore_default = cfg.restore_on_exit || !hw::config_has_key("restore_on_exit");
+    let restore_default = cfg.restore_on_exit;   // 默认关：设置默认长期保留
 
     let restore_on_exit = SwitchRow::new();
     restore_on_exit.set_title("退出时还原为启动时的状态");
@@ -1472,9 +1477,15 @@ curve_editor.set_on_changed(move |pts| {
 
     // ------------------------------------------------------------ 启动时套用保存的档位
     // 这些设置是内核状态，重启会被 BIOS 复位；用户勾了「登录时自动套用」就在这里补上。
-    if cfg.auto_apply {
+    // ⚠ 每次**登录**只套用一次，不是每次打开面板都套用。
+    //   旧行为把"面板启动"当成"登录"，于是用户手动关掉的睿频，
+    //   在下次打开面板时被档位重放写回 on（2026-10-25 实测）。
+    if cfg.auto_apply && !hw::auto_apply_done() {
         if let Some(preset) = boot_preset.as_deref().and_then(hw::preset) {
-            if !hw::cur_state().matches(preset) {
+            if hw::cur_state().matches(preset) {
+                // 已经是这个档位的状态：不用动硬件，记下"本次登录已处理"
+                hw::mark_auto_apply_done();
+            } else {
                 let weak = Rc::downgrade(&ui);
                 start_op(
                     &ui,
@@ -1486,8 +1497,12 @@ curve_editor.set_on_changed(move |pts| {
                             Err(errs.join("\n"))
                         }
                     },
-                    move |_res| {
-                        // 启动阶段失败就静默（多半是免密还没配好），不弹框打扰
+                    move |res| {
+                        // 只在真的成功后才记标记；失败（多半是免密没配好）下次启动再试。
+                        if res.is_ok() {
+                            hw::mark_auto_apply_done();
+                        }
+                        // 启动阶段失败就静默，不弹框打扰
                         if let Some(ui) = weak.upgrade() {
                             refresh(&ui);
                         }
@@ -1506,13 +1521,14 @@ curve_editor.set_on_changed(move |pts| {
     //   · 用户关掉「退出时还原」→ 不做任何还原，只清标记。
     // 用 Arc 而非 Rc：还原要放到后台线程执行，Snapshot 是纯数据（自动 Send/Sync）。
     let snap: Arc<hw::Snapshot> = Arc::new(hw::Snapshot::capture());
-    hw::mark_pending(&snap);
-
-    // 老配置没有 restore_on_exit 这个键时按"默认开"处理，避免升级后行为突变
-    let want_restore = {
-        let c = hw::load_config();
-        c.restore_on_exit || !hw::config_has_key("restore_on_exit")
-    };
+    // 只有用户**显式开启**"退出时还原"才落 pending 标记。
+    // 关掉时必须清掉旧标记 —— 否则下次启动的崩溃恢复会把旧快照写回去，
+    // 等于"我说了不还原，它还是还原"（2026-10-25 实测：睿频被写回 on）。
+    if hw::load_config().restore_on_exit {
+        hw::mark_pending(&snap);
+    } else {
+        hw::clear_pending();
+    }
     let hide_on_close = hw::load_config().hide_on_close;
 
     // 停止后台线程（1.2 s 刷新定时器 + GPU 采样线程）
@@ -1531,7 +1547,9 @@ curve_editor.set_on_changed(move |pts| {
         let app = app.clone();
         let win_weak = win.downgrade();
         move || {
-            if !want_restore {
+            // 现读配置：本次会话里把开关关掉后，退出行为要立刻跟着变
+            //（旧实现把启动时的值捕获进闭包，改了开关也得等下次启动才生效）。
+            if !hw::load_config().restore_on_exit {
                 hw::clear_pending();
                 app.quit();
                 return;
