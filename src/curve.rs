@@ -20,10 +20,13 @@
 //! （按 30%→3007 / 100%→5020 外推会得到"1% ≈ 2160"，而实测 5% 只有 87）。
 //! 所以必须对实测点做**分段线性插值**，并把下限夹到 [`FanCurve::MIN_RPM`]。
 
-/// 曲线上的一个点：温度(°C) → 目标转速(RPM)。
+/// 曲线上的一个点：x 轴值 → 目标转速(RPM)。
+///
+/// **x 轴的语义随曲线种类而变**：温度曲线里是 °C（见 [`FanCurve::parse`]），
+/// 功耗曲线里是瓦特（见 [`FanCurve::parse_power`]）。y 轴 `rpm` 两者相同。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurvePoint {
-    pub temp: u8,
+    pub x: u8,
     pub rpm: u16,
 }
 
@@ -52,11 +55,39 @@ impl FanCurve {
     pub const MIN_TEMP: u8 = 30;
     pub const MAX_TEMP: u8 = 100;
 
-    /// 从 `50:2000,60:2400` 解析。
+    /// 功耗轴（x 轴 = 瓦特）的合法范围。
+    ///
+    /// 为什么单独一套：本机 GPU 功耗墙上限 175 W（`nvidia-smi -q -d POWER` 实测），
+    /// u8 量程 0..=255 留足余量；若沿用温度轴的 30..=100，`110:4597` 这种
+    /// 功耗点会被 `normalize` **悄悄过滤掉**（2026-10-25 实测踩到）。
+    pub const MIN_WATTS: u8 = 0;
+    pub const MAX_WATTS: u8 = 255;
+
+    /// 从 `50:2000,60:2400` 解析**温度**曲线（x 轴 = °C）。
     ///
     /// **非法项直接跳过**（而不是整体失败）——配置文件被手改坏了不该让程序起不来，
     /// 这与 `hw::load_config` 的既有约定一致。
     pub fn parse(s: &str) -> Self {
+        Self::parse_bounded(s, Self::MIN_TEMP, Self::MAX_TEMP)
+    }
+
+    /// 从 `70:3000,110:4597` 解析**功耗**曲线（x 轴 = 瓦特）。
+    ///
+    /// # 为什么需要它（2026-10-25）
+    ///
+    /// 显存（GDDR6X）结温在 Linux 上**读不到**——NVML `temperature.memory` = N/A、
+    /// hwmon 无 NVIDIA 传感器、nvidia-settings 热传感器无句柄（已实测穷尽），
+    /// NVIDIA 官方论坛确认 GeForce 不经 NVML 暴露显存结温（NVAPI 专属）。
+    /// 而"核心 65°C 凉快、显存已经百度"正是 ComfyUI 冻死的头号嫌疑——
+    /// **板载功耗是唯一可得的显存热代理量**（显存热量 ∝ 带宽活动 × 时间）。
+    ///
+    /// 配置键 `curve.<预设>.gpu_power`；守护里 GPU 目标 = max(温度轴, 功耗轴)。
+    /// 与 [`FanCurve::parse`] 的唯一区别是 x 轴范围，其余语义完全一致。
+    pub fn parse_power(s: &str) -> Self {
+        Self::parse_bounded(s, Self::MIN_WATTS, Self::MAX_WATTS)
+    }
+
+    fn parse_bounded(s: &str, lo: u8, hi: u8) -> Self {
         let mut c = FanCurve::default();
         for item in s.split(',') {
             let item = item.trim();
@@ -69,9 +100,9 @@ impl FanCurve {
             let (Ok(t), Ok(r)) = (t.trim().parse::<u8>(), r.trim().parse::<u16>()) else {
                 continue;
             };
-            c.points.push(CurvePoint { temp: t, rpm: r });
+            c.points.push(CurvePoint { x: t, rpm: r });
         }
-        c.normalize();
+        c.normalize_bounded(lo, hi);
         c
     }
 
@@ -79,26 +110,30 @@ impl FanCurve {
     pub fn encode(&self) -> String {
         self.points
             .iter()
-            .map(|p| format!("{}:{}", p.temp, p.rpm))
+            .map(|p| format!("{}:{}", p.x, p.rpm))
             .collect::<Vec<_>>()
             .join(",")
     }
 
-    /// 规范化：按温度排序 → 合并同温度（取后写入的）→ 夹取范围 → 截断点数。
+    /// 规范化（温度轴）：按 x 排序 → 合并同 x（取后写入的）→ 夹取范围 → 截断点数。
     pub fn normalize(&mut self) {
-        self.points
-            .retain(|p| (Self::MIN_TEMP..=Self::MAX_TEMP).contains(&p.temp));
+        self.normalize_bounded(Self::MIN_TEMP, Self::MAX_TEMP);
+    }
+
+    /// 同 [`FanCurve::normalize`]，但 x 轴合法范围由调用方给定（功耗曲线用 0..=255）。
+    pub fn normalize_bounded(&mut self, lo: u8, hi: u8) {
+        self.points.retain(|p| (lo..=hi).contains(&p.x));
         for p in &mut self.points {
             p.rpm = p.rpm.clamp(Self::MIN_RPM, Self::MAX_RPM);
         }
-        // `sort_by_key` 是稳定排序 ⇒ 同温度的点保持"谁先来谁在前"，
-        // 于是下面这一趟"同温度用后者覆盖"就等于"后写入的优先"。
+        // `sort_by_key` 是稳定排序 ⇒ 同 x 的点保持"谁先来谁在前"，
+        // 于是下面这一趟"同 x 用后者覆盖"就等于"后写入的优先"。
         // ⚠ 不能用 `dedup_by_key`：它保留的是**第一个**，与文档语义相反。
-        self.points.sort_by_key(|p| p.temp);
+        self.points.sort_by_key(|p| p.x);
         let mut merged: Vec<CurvePoint> = Vec::with_capacity(self.points.len());
         for p in self.points.drain(..) {
             match merged.last_mut() {
-                Some(last) if last.temp == p.temp => *last = p,
+                Some(last) if last.x == p.x => *last = p,
                 _ => merged.push(p),
             }
         }
@@ -110,26 +145,26 @@ impl FanCurve {
         self.points.is_empty()
     }
 
-    /// 该温度下的目标转速。
+    /// 该 x 值下的目标转速（温度曲线传 °C，功耗曲线传 W）。
     ///
-    /// - 低于首点温度 → `None`（**交回固件**，不是给低转速）
-    /// - 高于末点温度 → 末点的转速
+    /// - 低于首点 → `None`（**交回固件**，不是给低转速）
+    /// - 高于末点 → 末点的转速
     /// - 中间 → 相邻两点线性插值
-    pub fn target_rpm(&self, temp: u8) -> Option<u16> {
+    pub fn target_rpm(&self, x: u8) -> Option<u16> {
         let first = self.points.first()?;
-        if temp < first.temp {
+        if x < first.x {
             return None;
         }
         let last = self.points.last()?;
-        if temp >= last.temp {
+        if x >= last.x {
             return Some(last.rpm);
         }
         for w in self.points.windows(2) {
             let (a, b) = (w[0], w[1]);
-            if temp >= a.temp && temp <= b.temp {
-                // 温度区间为 0 的情况已被 dedup_by_key 消除
-                let span = (b.temp - a.temp) as u32;
-                let step = (b.rpm as u32 - a.rpm as u32) * (temp - a.temp) as u32 / span;
+            if x >= a.x && x <= b.x {
+                // x 区间为 0 的情况已被 normalize 的同值合并消除
+                let span = (b.x - a.x) as u32;
+                let step = (b.rpm as u32 - a.rpm as u32) * (x - a.x) as u32 / span;
                 return Some((a.rpm as u32 + step) as u16);
             }
         }
@@ -233,7 +268,7 @@ mod tests {
         // 低于 MIN_RPM 被抬到 MIN_RPM；同温度只留一个
         let c = FanCurve::parse("50:100,50:5000,120:3000,10:3000");
         assert_eq!(c.points.len(), 1);
-        assert_eq!(c.points[0].temp, 50);
+        assert_eq!(c.points[0].x, 50);
         assert_eq!(c.points[0].rpm, FanCurve::MAX_RPM);
     }
 
@@ -274,6 +309,27 @@ mod tests {
         assert_eq!(rpm_to_pct(500), 20);
         assert_eq!(rpm_to_pct(4979), 50); // 标定表末点，正好对应 50%
         assert_eq!(rpm_to_pct(4950), 49); // 4482~4979 之间线性插值
+    }
+
+    #[test]
+    fn power_curve_uses_watt_range() {
+        // 温度轴的 30..100 会把 110W 过滤掉；功耗轴 0..255 必须原样保留
+        let c = FanCurve::parse_power("70:3000,110:4597,300:5000");
+        assert_eq!(c.encode(), "70:3000,110:4597"); // 300W 越界被丢
+        assert_eq!(c.target_rpm(69), None); // 低于首点 → 交回固件
+        assert_eq!(c.target_rpm(70), Some(3000));
+        assert_eq!(c.target_rpm(90), Some(3798)); // 插值：(4597-3000)*20/40=798
+        assert_eq!(c.target_rpm(110), Some(4597));
+        assert_eq!(c.target_rpm(200), Some(4597)); // 末点封顶
+        // 温度曲线仍然过滤 >100°C 的点（两条轴互不干扰）
+        let t = FanCurve::parse("70:3000,110:4597");
+        assert_eq!(t.encode(), "70:3000");
+    }
+
+    #[test]
+    fn power_curve_skips_garbage() {
+        let c = FanCurve::parse_power("垃圾,70:3000,,xx:yy,110:abc,90:3500");
+        assert_eq!(c.encode(), "70:3000,90:3500");
     }
 
     #[test]

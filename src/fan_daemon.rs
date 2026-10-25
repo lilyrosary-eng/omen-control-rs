@@ -8,6 +8,19 @@
 //! 温度 ≥ 末点      →  末点的 RPM
 //! ```
 //!
+//! # GPU 通道有两条轴（2026-10-25 新增功耗轴）
+//!
+//! ```text
+//! curve.<preset>.gpu        温度(°C) → 转速
+//! curve.<preset>.gpu_power  功耗(W)  → 转速   ← 显存热代理轴，可选
+//! GPU 目标 = max(温度轴, 功耗轴)
+//! ```
+//!
+//! 为什么加功耗轴：GDDR6X 显存结温在 Linux 上**读不到**（NVML 不暴露、
+//! hwmon 无传感器，实测穷尽），而"核心 65°C 凉快、显存已经百度"正是
+//! ComfyUI 冻死的头号嫌疑——板载功耗是唯一可得的显存热代理量。
+//! 详见 `gpu_stats` 与 `curve::FanCurve::parse_power` 的文档。
+//!
 //! # 为什么要有它（而不是塞进 GUI）
 //!
 //! GUI 关掉后曲线还得继续生效；开机也要能自启。所以做成独立子命令：
@@ -58,6 +71,12 @@ fn print_help() {
            --curve SPEC     临时覆盖曲线（不写配置文件）\n\
                             例：--curve 50:2000,70:4000 --simulate 40,60,80\n\
            -h, --help       显示本帮助\n\n\
+          GPU 通道有两条轴，取更激进的：\n\
+           curve.<预设>.gpu        GPU 温度(°C) → 转速\n\
+           curve.<预设>.gpu_power  GPU 功耗(W) → 转速（显存热代理，可选）\n\
+          例：curve.performance.gpu_power=70:3000,110:4597\n\n\
+          ⚠ --simulate 只喂温度（功耗是实时读数，没有模拟意义）；\n\
+             功耗轴用 --dry-run 在真机上验证。\n\n\
          退出（含 Ctrl-C）会自动交回固件：写 0 + unthrottle 1→0。\n\
          曲线在 GUI 的「性能档位 → 风扇曲线」里编辑；也可以直接改配置：\n\
            curve.balanced=60:2200,72:3200,82:4597"
@@ -149,21 +168,41 @@ fn package_temp() -> Option<u8> {
     None
 }
 
-fn gpu_temp() -> u8 {
+/// 一次调用同时取 **GPU 温度（°C）与板载功耗（W）**。
+///
+/// # 为什么要功耗（2026-10-25）
+///
+/// 功耗是**显存热的代理量**：GDDR6X 结温在 Linux 上读不到（NVML
+/// `temperature.memory` = N/A、hwmon 无传感器、nvidia-settings 热传感器
+/// BadHandle，已实测穷尽；NVIDIA 官方论坛确认 GeForce 不经 NVML 暴露它），
+/// 而显存热量 ∝ 带宽活动 × 时间——**板载功耗是唯一可得的真实信号**。
+/// 没有它，"核心 65°C 凉快、显存已经百度"这种状态对策略完全不可见
+/// （ComfyUI 冻死的头号嫌疑正是这个）。
+///
+/// 读不到功耗（老驱动 / `N/A`）时返回 `None`，该轴自动退出决策，行为退回纯温度模式。
+fn gpu_stats() -> (u8, Option<f64>) {
     let Ok(out) = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=temperature.gpu",
+            "--query-gpu=temperature.gpu,power.draw",
             "--format=csv,noheader,nounits",
         ])
         .output()
     else {
-        return 0;
+        return (0, None);
     };
-    String::from_utf8_lossy(&out.stdout)
+    let line = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
-        .and_then(|l| l.trim().parse::<u8>().ok())
-        .unwrap_or(0)
+        .unwrap_or("")
+        .to_string();
+    let mut it = line.split(',');
+    let t = it
+        .next()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(0);
+    // `N/A` / 空串 / 无法解析 → None（该轴不参与）
+    let p = it.next().and_then(|s| s.trim().parse::<f64>().ok());
+    (t, p)
 }
 
 /// 温度平滑：**升温快、降温慢**（非对称），并带变化率上限。
@@ -395,7 +434,7 @@ pub fn run(args: &[String]) {
         // ⚠ 预览用**同一个温度**同时喂两者，所以这里看到的是"若 CPU 与 GPU 同温"
         //   的结果；真机是两个独立读数。
         let gpu_sim = cfg.gpu_curve_for(&key);
-        let first = cur.points.first().map(|p| p.temp).unwrap_or(0);
+        let first = cur.points.first().map(|p| p.x).unwrap_or(0);
         println!("  温度   目标RPM   写 fan_speed   温度限制决策");
         println!("  ────   ───────   ────────────   ──────────────────────────");
         for tok in list.split(',') {
@@ -510,7 +549,7 @@ let mut base_pl1: Option<u32> = None;
 
     loop {
         let tcr = cpu_temp();
-        let tgr = gpu_temp();
+        let (tgr, pgw) = gpu_stats();
 
 // ── 时间迟滞平滑：温度要稳定 τ 秒，其结果才被采纳（见 `smooth` 的文档）──
         let lag = cfg.fan_lag;
@@ -536,10 +575,36 @@ let mut base_pl1: Option<u32> = None;
         //
         // 没单独配 GPU 曲线时 `gpu_curve_for` 会回落到 CPU 曲线 ⇒ 行为与旧版完全一致。
         let gpu_cur = cfg.gpu_curve_for(&key);
-        // 注意：迟滞只作用于**温度**（上面的 `smooth`），**不碰曲线** ——
-        // 曲线输出的转速就是最终写入值，用户编辑的形状与量级都原样保留。
+        let gpu_pow_cur = cfg.gpu_power_curve_for(&key);
+        // ── GPU 通道：温度轴 + 功耗轴，取更激进的 ──
+        //
+        // 功耗轴是**显存热的代理**（结温不可读的完整理由见 `gpu_stats` 的文档）。
+        // 与 CPU/GPU 双曲线取 max 是同一个模式：功耗只允许**加冷**，
+        // 永远不会把风扇摁到温度轴想给的水平之下。
+        //
+        // 功耗**不过平滑**：温度是滞后量，功耗是先行量（显存热跟着功耗涨，
+        // 有热时间常数，等温度反应过来已经烤完了）；防抖交给既有的
+        // `step_rpm` 步进节流——它本来就为"在阈值附近抖动"而设计。
+        // 没配 `gpu_power` 曲线时 `gpu_pow_cur` 是空的 ⇒ `target_rpm` 恒 None
+        // ⇒ 行为与加这个轴之前逐字节一致。
+        // ⚠ 功耗取**四舍五入**后的整数瓦查曲线：日志按 `{:.0}` 显示（也是四舍五入），
+        // 两者必须同一个数，否则"日志说 15W 转速却按 14W 算"会在调曲线时误导。
+        let power_rpm = pgw.and_then(|w| gpu_pow_cur.target_rpm(w.round().clamp(0.0, 255.0) as u8));
         let cpu_rpm = cur.target_rpm(tc);
-        let gpu_rpm = if tgr > 0 { gpu_cur.target_rpm(tg) } else { None };
+        let gpu_temp_rpm = if tgr > 0 { gpu_cur.target_rpm(tg) } else { None };
+        let gpu_rpm = match (gpu_temp_rpm, power_rpm) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // 哪根轴拍板（只影响日志标注，便于回头调曲线；Option 的 Ord：None < Some）
+        let by_power = power_rpm > gpu_temp_rpm;
+        // 日志后缀：功耗读数 + 触发轴。功耗读不到时什么都不加。
+        let pw_s = match pgw {
+            Some(w) => format!(" @ {w:.0}W{}", if by_power { "（功耗轴）" } else { "" }),
+            None => String::new(),
+        };
         let target = match (cpu_rpm, gpu_rpm) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
@@ -553,10 +618,10 @@ let mut base_pl1: Option<u32> = None;
                     if !dry {
                         let _ = omen::set_fan_speed(None, 0);
                     }
-                    println!("→ 交回固件（CPU {tc}°C / GPU {tg}°C）");
+                    println!("→ 交回固件（CPU {tc}°C / GPU {tg}°C{pw_s}）");
                     last = None;
                 } else if verbose {
-                    println!("  保持固件控制（CPU {tc}°C / GPU {tg}°C）");
+                    println!("  保持固件控制（CPU {tc}°C / GPU {tg}°C{pw_s}）");
                 }
             }
             Some(rpm) => {
@@ -567,11 +632,11 @@ let mut base_pl1: Option<u32> = None;
                 if need {
                     let pct = curve::rpm_to_pct(rpm);
                     if dry {
-                        println!("[dry] 写 {pct}%（≈{rpm} RPM，目标）  CPU {tc}°C / GPU {tg}°C（原始 {tcr}/{tgr}）");
+                        println!("[dry] 写 {pct}%（≈{rpm} RPM，目标）  CPU {tc}°C / GPU {tg}°C{pw_s}（原始 {tcr}/{tgr}）");
                     } else {
                         match omen::set_fan_speed(None, pct) {
                             Ok(_) => println!(
-                                "→ 写 {pct}%（≈{rpm} RPM，目标）  CPU {tc}°C / GPU {tg}°C（原始 {tcr}/{tgr}）  实际 {:?}",
+                                "→ 写 {pct}%（≈{rpm} RPM，目标）  CPU {tc}°C / GPU {tg}°C{pw_s}（原始 {tcr}/{tgr}）  实际 {:?}",
                                 omen::fan_rpms()
                             ),
                             Err(e) => eprintln!("  ✗ 写入失败：{e}"),
@@ -579,7 +644,7 @@ let mut base_pl1: Option<u32> = None;
                     }
                     last = Some(rpm);
                 } else if verbose {
-                    println!("  保持 {rpm} RPM（当前档位已足够）CPU {tc}°C / GPU {tg}°C");
+                    println!("  保持 {rpm} RPM（当前档位已足够）CPU {tc}°C / GPU {tg}°C{pw_s}");
                 }
 
                 // 自检：接管中转速异常 ⇒ 交回固件并退出
@@ -697,7 +762,7 @@ let mut base_pl1: Option<u32> = None;
         // 心跳：稳定运行期间也定期出声，否则用户会以为卡死了（实测踩过）
         if hb_every > 0 && tick % hb_every == 0 {
             println!(
-                "  [心跳 {}s] CPU {tc}°C / GPU {tg}°C → {}",
+                "  [心跳 {}s] CPU {tc}°C / GPU {tg}°C{pw_s} → {}",
                 tick * interval,
                 match last {
                     None => "固件控制中".to_string(),

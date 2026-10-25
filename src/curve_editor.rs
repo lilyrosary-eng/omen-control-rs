@@ -179,23 +179,23 @@ impl CurveEditor {
                 let Some(orig) = s.drag_orig else { return };
                 // GTK4 的 drag_update 给的是**相对起点的偏移（像素）**，不是绝对坐标。
                 // 所以：该点的原始像素位置 + 偏移 → 再换回数据坐标。
-                let (sx, sy) = to_px(orig.temp as f64, orig.rpm as f64, w, h);
+                let (sx, sy) = to_px(orig.x as f64, orig.rpm as f64, w, h);
                 let (nt, nr) = to_data(sx + ox, sy + oy, w, h);
                 let mut t = nt.round().clamp(T_MIN, T_MAX) as u8;
                 let r = nr.round().clamp(R_MIN, R_MAX) as u16;
                 // 保持温度严格递增：夹在左右邻点之间（否则插值会除零、语义也乱）
-                let lo = if i > 0 { s.points[i - 1].temp + 1 } else { FanCurve::MIN_TEMP };
+                let lo = if i > 0 { s.points[i - 1].x + 1 } else { FanCurve::MIN_TEMP };
                 let hi = if i + 1 < s.points.len() {
-                    s.points[i + 1].temp.saturating_sub(1)
+                    s.points[i + 1].x.saturating_sub(1)
                 } else {
                     FanCurve::MAX_TEMP
                 };
                 if lo <= hi {
                     t = t.clamp(lo, hi);
                 } else {
-                    t = orig.temp; // 空间不够就不动横轴，只让纵轴动
+                    t = orig.x; // 空间不够就不动横轴，只让纵轴动
                 }
-                s.points[i] = CurvePoint { temp: t, rpm: r };
+                s.points[i] = CurvePoint { x: t, rpm: r };
                 let p = s.points[i];
                 drop(s);
                 ed3.set_hint_for(p);
@@ -241,11 +241,11 @@ impl CurveEditor {
                         } else {
                             let (t, r) = to_data(x, y, w, h);
                             let p = CurvePoint {
-                                temp: (t.round() as u8).clamp(FanCurve::MIN_TEMP, FanCurve::MAX_TEMP),
+                                x: (t.round() as u8).clamp(FanCurve::MIN_TEMP, FanCurve::MAX_TEMP),
                                 rpm: (r.round() as u16).clamp(FanCurve::MIN_RPM, FanCurve::MAX_RPM),
                             };
                             // 同温度已有别的点 ⇒ 拒绝（避免出现两个点叠在一条竖线上）
-                            if s.points.iter().any(|q| q.temp == p.temp) {
+                            if s.points.iter().any(|q| q.x == p.x) {
                                 ed2.set_hint_text("该温度已有圆点，直接拖它就行。");
                             } else {
                                 s.points.push(p);
@@ -273,7 +273,7 @@ impl CurveEditor {
     fn nearest_in(points: &[CurvePoint], x: f64, y: f64, w: f64, h: f64) -> (Option<usize>, f64) {
         let mut best: (Option<usize>, f64) = (None, HIT_R);
         for (i, p) in points.iter().enumerate() {
-            let (px, py) = to_px(p.temp as f64, p.rpm as f64, w, h);
+            let (px, py) = to_px(p.x as f64, p.rpm as f64, w, h);
             let d = ((px - x).powi(2) + (py - y).powi(2)).sqrt();
             if d < best.1 {
                 best = (Some(i), d);
@@ -286,7 +286,7 @@ impl CurveEditor {
         let pct = crate::curve::rpm_to_pct(p.rpm);
         self.hint.set_text(&format!(
             "当前点：{}°C → {} RPM（写入 {}%）",
-            p.temp, p.rpm, pct
+            p.x, p.rpm, pct
         ));
     }
 
@@ -442,7 +442,7 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, st: &Rc<RefCell<State>>) {
 
     // 首点左侧：交回固件的区间 —— 画一条虚线示意
     let first = pts[0];
-    let (fx, _) = to_px(first.temp as f64, R_MIN, w, h);
+    let (fx, _) = to_px(first.x as f64, R_MIN, w, h);
     if fx > PAD_L {
         cr.set_source_rgb(c.off.0, c.off.1, c.off.2);
         cr.set_line_width(1.0);
@@ -455,7 +455,7 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, st: &Rc<RefCell<State>>) {
 
     // 首点往左那一段用**灰色虚线**：它表示"低于首点温度就交回固件"，
     // 不是"给这个转速"。画成实线会被误读成"55°C 以下也是 2400 RPM"。
-    let (px0, py0) = to_px(first.temp as f64, first.rpm as f64, w, h);
+    let (px0, py0) = to_px(first.x as f64, first.rpm as f64, w, h);
     cr.set_source_rgb(c.off.0, c.off.1, c.off.2);
     cr.set_line_width(1.5);
     cr.set_dash(&[4.0, 4.0], 0.0);
@@ -469,18 +469,18 @@ fn draw(cr: &cairo::Context, w: i32, h: i32, st: &Rc<RefCell<State>>) {
     cr.set_line_width(2.0);
     cr.move_to(px0, py0);
     for p in pts.iter().skip(1) {
-        let (px, py) = to_px(p.temp as f64, p.rpm as f64, w, h);
+        let (px, py) = to_px(p.x as f64, p.rpm as f64, w, h);
         cr.line_to(px, py);
     }
     // 末点往右拉平（这条是真的：target_rpm 对超过末点温度返回末点转速）
     let last = *pts.last().unwrap();
-    let (_, ly) = to_px(last.temp as f64, last.rpm as f64, w, h);
+    let (_, ly) = to_px(last.x as f64, last.rpm as f64, w, h);
     cr.line_to(PAD_L + iw - 1.0, ly);
     cr.stroke().ok();
 
     // 圆点
     for (i, p) in pts.iter().enumerate() {
-        let (px, py) = to_px(p.temp as f64, p.rpm as f64, w, h);
+        let (px, py) = to_px(p.x as f64, p.rpm as f64, w, h);
         let dragging = s.drag == Some(i);
         let (col, rad) = if dragging { (c.sel, 6.0) } else { (c.dot, 4.5) };
         cr.set_source_rgb(col.0, col.1, col.2);

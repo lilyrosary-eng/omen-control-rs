@@ -1239,6 +1239,16 @@ pub struct Config {
     /// 配置键是 `curve.<预设>.gpu`。**不配就用 CPU 那条**（行为与旧版一致），
     /// 这样老配置升级后不需要补一条 GPU 曲线。
     pub gpu_curves: Vec<(String, crate::curve::FanCurve)>,
+    /// **GPU 功耗 → 转速**曲线（可选，**显存热代理轴**）。
+    ///
+    /// 配置键 `curve.<预设>.gpu_power`。**不配就是空轴**——不像 `.gpu` 那样回落到
+    /// CPU 曲线：功耗轴是渐进功能，默认关闭，老配置行为逐字节不变。
+    ///
+    /// 为什么需要它：GDDR6X 显存结温在 Linux 上读不到（NVML 不暴露、hwmon 无
+    /// 传感器，2026-10-25 实测穷尽），而"核心 65°C 凉快、显存已经百度"正是
+    /// ComfyUI 冻死的头号嫌疑——板载功耗是唯一可得的显存热代理量。
+    /// 守护里 GPU 通道目标 = max(温度轴, 功耗轴)，功耗只允许**加冷**。
+    pub gpu_power_curves: Vec<(String, crate::curve::FanCurve)>,
     /// 风扇曲线守护是否启用（`--fan-daemon` 读它）。
     pub fan_daemon: bool,
     /// 风扇迟滞档位：`long`（安静）/ `mid`（标准）/ `short`（灵敏），缺省 `mid`。
@@ -1294,6 +1304,23 @@ impl Config {
     /// 该预设**有没有单独配** GPU 曲线（UI 用它显示"独立/跟随 CPU"）。
     pub fn has_own_gpu_curve(&self, preset_key: &str) -> bool {
         self.gpu_curves.iter().any(|(k, _)| k == preset_key)
+    }
+
+    /// 取某个预设的 **GPU 功耗**曲线。**没配就是空曲线**（该轴不参与决策）——
+    /// 与 `gpu_curve_for` 的"回落 CPU 曲线"不同：功耗轴是显式 opt-in 的。
+    pub fn gpu_power_curve_for(&self, preset_key: &str) -> crate::curve::FanCurve {
+        match self.gpu_power_curves.iter().find(|(k, _)| k == preset_key) {
+            Some((_, c)) => c.clone(),
+            None => crate::curve::FanCurve::default(),
+        }
+    }
+
+    /// 设置某个预设的 GPU 功耗曲线。传**空曲线**表示"关掉这个轴"（会被如实删掉）。
+    pub fn set_gpu_power_curve(&mut self, preset_key: &str, c: crate::curve::FanCurve) {
+        self.gpu_power_curves.retain(|(k, _)| k != preset_key);
+        if !c.points.is_empty() {
+            self.gpu_power_curves.push((preset_key.to_string(), c));
+        }
     }
 
     /// 有效读数不透明度；老配置里只有 `hud_opacity` 时用它兜底。
@@ -1387,20 +1414,31 @@ pub fn load_config() -> Config {
             "fan_daemon" => c.fan_daemon = matches!(v, "1" | "true" | "yes"),
             "fan_lag" => c.fan_lag = FanLag::from_key(v),
             k => {
-                // curve.<preset>=50:2000,60:2400,...        —— CPU 曲线
-                // curve.<preset>.gpu=60:2200,72:3200,...    —— GPU 曲线（可选）
+                // curve.<preset>=50:2000,60:2400,...        —— CPU 温度曲线
+                // curve.<preset>.gpu=60:2200,72:3200,...    —— GPU 温度曲线（可选）
+                // curve.<preset>.gpu_power=70:3000,...      —— GPU 功耗曲线（可选，显存热代理轴）
                 // 解析失败就当空曲线（不接管）
                 if let Some(key) = k.strip_prefix("curve.") {
                     let key = key.trim();
                     if !key.is_empty() {
-                        let parsed = crate::curve::FanCurve::parse(v);
-                        if let Some(base) = key.strip_suffix(".gpu") {
+                        // ⚠ `.gpu_power` 必须**先**判断：`balanced.gpu_power` 不以
+                        // `.gpu` 结尾，漏了这分支会被当成名叫 "balanced.gpu_power"
+                        // 的 CPU 曲线存进 curves，功耗轴静默失效。
+                        if let Some(base) = key.strip_suffix(".gpu_power") {
                             let base = base.trim();
                             if !base.is_empty() {
-                                c.set_gpu_curve(base, parsed);
+                                c.set_gpu_power_curve(
+                                    base,
+                                    crate::curve::FanCurve::parse_power(v),
+                                );
+                            }
+                        } else if let Some(base) = key.strip_suffix(".gpu") {
+                            let base = base.trim();
+                            if !base.is_empty() {
+                                c.set_gpu_curve(base, crate::curve::FanCurve::parse(v));
                             }
                         } else {
-                            c.set_curve(key, parsed);
+                            c.set_curve(key, crate::curve::FanCurve::parse(v));
                         }
                     }
                 }
@@ -1451,6 +1489,9 @@ pub fn save_config(c: &Config) -> io::Result<()> {
         if let Some((_, cur)) = c.gpu_curves.iter().find(|(k, _)| k == key) {
             body.push_str(&format!("curve.{key}.gpu={}\n", cur.encode()));
         }
+        if let Some((_, cur)) = c.gpu_power_curves.iter().find(|(k, _)| k == key) {
+            body.push_str(&format!("curve.{key}.gpu_power={}\n", cur.encode()));
+        }
     }
     for (key, cur) in &c.curves {
         if !crate::curve::PRESET_KEYS.contains(&key.as_str()) {
@@ -1460,6 +1501,11 @@ pub fn save_config(c: &Config) -> io::Result<()> {
     for (key, cur) in &c.gpu_curves {
         if !crate::curve::PRESET_KEYS.contains(&key.as_str()) {
             body.push_str(&format!("curve.{key}.gpu={}\n", cur.encode()));
+        }
+    }
+    for (key, cur) in &c.gpu_power_curves {
+        if !crate::curve::PRESET_KEYS.contains(&key.as_str()) {
+            body.push_str(&format!("curve.{key}.gpu_power={}\n", cur.encode()));
         }
     }
     body.push_str(&format!("fan_daemon={}\n", if c.fan_daemon { 1 } else { 0 }));
